@@ -10,13 +10,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
+logger = logging.getLogger("chattts.config")
+
 
 def _int_env(name: str, default: int) -> int:
-    """读取正整数环境变量；非法值回退默认值，保证零配置也能启动。"""
+    """读取正整数环境变量；非法值发出 warning 并回退默认值。"""
 
     raw = os.getenv(name)
     if raw is None:
@@ -24,12 +27,20 @@ def _int_env(name: str, default: int) -> int:
     try:
         value = int(raw)
     except ValueError:
+        logger.warning(
+            "环境变量 %s=%r 不是合法整数，已回退默认值 %d。", name, raw, default
+        )
         return default
-    return value if value > 0 else default
+    if value <= 0:
+        logger.warning(
+            "环境变量 %s=%r 必须为正整数，已回退默认值 %d。", name, raw, default
+        )
+        return default
+    return value
 
 
 def _float_env(name: str, default: float) -> float:
-    """读取正浮点环境变量；非法或非正值回退默认值。"""
+    """读取正浮点环境变量；非法或非正值发出 warning 并回退默认值。"""
 
     raw = os.getenv(name)
     if raw is None:
@@ -37,8 +48,16 @@ def _float_env(name: str, default: float) -> float:
     try:
         value = float(raw)
     except ValueError:
+        logger.warning(
+            "环境变量 %s=%r 不是合法浮点数，已回退默认值 %s。", name, raw, default
+        )
         return default
-    return value if value > 0 else default
+    if value <= 0:
+        logger.warning(
+            "环境变量 %s=%r 必须为正浮点数，已回退默认值 %s。", name, raw, default
+        )
+        return default
+    return value
 
 
 def _default_model_dir() -> Path:
@@ -63,14 +82,17 @@ def _default_model_dir() -> Path:
     return candidates[0]
 
 
-def _resolve_device() -> str:
+def _resolve_device(raw: str | None = None) -> str:
     """解析推理设备。
 
     ``DEVICE=auto``（默认）时自动探测 CUDA：有 GPU 用 ``cuda``，否则回退 ``cpu``。
-    显式设为 ``cuda`` / ``cpu`` 时直接采用。探测在导入期完成，开销很小。
+    显式设为 ``cuda`` / ``cpu`` 时直接采用。
+
+    探测会触发 ``import torch``，开销较大；因此 ``Settings`` 不在 import 期间
+    立即调用，而是用 ``default_factory`` 推迟到实例化（lifespan 中）才解析。
     """
 
-    raw = (os.getenv("DEVICE") or "auto").strip().lower()
+    raw = (raw if raw is not None else os.getenv("DEVICE") or "auto").strip().lower()
     if raw in ("cuda", "cpu"):
         return raw
     # auto：尝试探测 CUDA。torch 未安装或无 GPU 时一律回退 CPU。
@@ -79,6 +101,7 @@ def _resolve_device() -> str:
 
         return "cuda" if torch.cuda.is_available() else "cpu"
     except Exception:  # noqa: BLE001 - 探测失败时安全回退 CPU
+        logger.warning("CUDA 设备探测失败，回退 CPU。", exc_info=True)
         return "cpu"
 
 

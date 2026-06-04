@@ -107,20 +107,17 @@ function App() {
     };
   }, []);
 
-  // 组件卸载或音频 URL 变化时释放对象 URL，避免内存泄漏。
-  React.useEffect(() => {
-    return () => {
-      if (audioUrl) {
-        URL.revokeObjectURL(audioUrl);
-      }
-    };
-  }, [audioUrl]);
-
-  // 组件卸载时确保中止进行中的流式请求并停止播放，避免资源泄漏。
+  // 组件卸载时统一释放对象 URL、中止进行中的流式请求并停止播放。
+  // 这里访问的是 audioUrl 的最新值（闭包通过 ref 读取），因此 effect 依赖空数组即可。
+  const audioUrlRef = React.useRef("");
+  audioUrlRef.current = audioUrl;
   React.useEffect(() => {
     return () => {
       abortRef.current?.abort();
       playerRef.current?.stop();
+      if (audioUrlRef.current) {
+        URL.revokeObjectURL(audioUrlRef.current);
+      }
     };
   }, []);
 
@@ -221,6 +218,11 @@ function App() {
     const controller = new AbortController();
     abortRef.current = controller;
     const player = new StreamingAudioPlayer();
+    // 看门狗：30s 内 pending 仍未推进时，主动中止流并提示用户。
+    player.setStuckHandler(() => {
+      controller.abort();
+      setError("流式分片接收超时，请重试");
+    }, 30_000);
     playerRef.current = player;
 
     // 暂存各分片的原始 PCM（按 index），用于完成后重组下载用的完整 WAV。
@@ -268,9 +270,10 @@ function App() {
           if (!streamSampleRate) {
             streamSampleRate = decoded.sampleRate;
           } else if (decoded.sampleRate !== streamSampleRate) {
-            // 各分片来自同一模型，采样率理应一致；不一致时以首个为准并告警。
-            console.warn(
-              `分片采样率不一致：${decoded.sampleRate} != ${streamSampleRate}，以首个为准`,
+            // 各分片应当来自同一模型、同一采样率；不一致会让下载的 WAV 音高错乱。
+            // 直接中止流并提示用户，而不是“以首个为准”静默写错。
+            throw new Error(
+              `分片采样率不一致（${decoded.sampleRate} != ${streamSampleRate}），流被中止`,
             );
           }
           // 暂存原始 PCM（下载用），并把解码后的 Float32 入队播放（播放用）。
@@ -337,10 +340,12 @@ function App() {
       return;
     }
     const link = document.createElement("a");
-    link.href = URL.createObjectURL(audioBlob);
+    const url = URL.createObjectURL(audioBlob);
+    link.href = url;
     link.download = `chattts-${speaker || "voice"}.wav`;
     link.click();
-    URL.revokeObjectURL(link.href);
+    // 立刻 revoke 在 Safari 上可能让下载流尚未建立就失败，延后 1s 释放。
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   // 顶栏状态药丸文案：优先展示设备 + 模型状态。

@@ -4,7 +4,7 @@
 - 启动时在 ``lifespan`` 内异步加载 ChatTTS 模型；
 - 注册健康检查、音色、随机音色、合成等路由；
 - 挂载前端构建产物，并提供 SPA fallback；
-- 统一异常处理（校验错误 422 → 400）。
+- 注册全局异常处理：参数错误 → 400，模型 / 排队类 → 503，避免路由层重复 try/except。
 """
 
 from __future__ import annotations
@@ -19,16 +19,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.exception_handlers import request_validation_exception_handler
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .concurrency import QueueTimeoutError, inference_gate
 from .config import settings
-from .schemas import HealthResponse, SpeakerResponse, TTSRequest, resolve_speaker
-from .speakers import speaker_registry
+from .schemas import HealthResponse, SpeakerResponse, TTSRequest
+from .speakers import parse_speaker, speaker_registry
 from .tts_engine import ModelAssetError, SynthesisError, encode_wav, engine
 
 logger = logging.getLogger("chattts.service")
@@ -46,6 +45,9 @@ STATIC_CANDIDATES = (
     APP_ROOT / "static",
     PROJECT_ROOT / "static",
 )
+
+# SPA fallback 不能误把 FastAPI 内置文档路径吞进 index.html。
+_FASTAPI_DOCS_PATHS = frozenset({"docs", "redoc", "openapi.json"})
 
 
 def _static_dir() -> Path | None:
@@ -80,13 +82,48 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="ChatTTS 中文语音合成服务", version="1.0.0", lifespan=lifespan)
 
 
+# ---------------------------------------------------------------------- #
+# 全局异常处理：路由内只写业务流程，错误层级集中映射到 HTTP 状态码。
+# ---------------------------------------------------------------------- #
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request, exc: RequestValidationError):
+async def validation_exception_handler(
+    _: Request, exc: RequestValidationError
+) -> JSONResponse:
     """把 FastAPI/Pydantic 默认 422 转为需求文档约定的 400。"""
 
-    response = await request_validation_exception_handler(request, exc)
-    response.status_code = 400
-    return response
+    return JSONResponse(content={"detail": exc.errors()}, status_code=400)
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
+    """业务侧 ``ValueError``（音色非法、文本为空、语速越界等）统一映射为 400。"""
+
+    return JSONResponse(content={"detail": str(exc)}, status_code=400)
+
+
+@app.exception_handler(SynthesisError)
+async def synthesis_error_handler(_: Request, exc: SynthesisError) -> JSONResponse:
+    """合成阶段失败（已包装底层错误）→ 400。"""
+
+    return JSONResponse(content={"detail": str(exc)}, status_code=400)
+
+
+@app.exception_handler(ModelAssetError)
+async def model_asset_error_handler(
+    _: Request, exc: ModelAssetError
+) -> JSONResponse:
+    """模型资产缺失 / 加载失败 → 503。"""
+
+    return JSONResponse(content={"detail": str(exc)}, status_code=503)
+
+
+@app.exception_handler(QueueTimeoutError)
+async def queue_timeout_error_handler(
+    _: Request, exc: QueueTimeoutError
+) -> JSONResponse:
+    """推理排队超时 → 503。"""
+
+    return JSONResponse(content={"detail": str(exc)}, status_code=503)
 
 
 # 挂载前端静态资源目录（assets）。
@@ -95,6 +132,18 @@ if static_dir is not None:
     assets_dir = static_dir / "assets"
     if assets_dir.exists():
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+
+async def ensure_engine_ready() -> None:
+    """路由依赖：在进入业务逻辑前确保模型已加载。
+
+    模型未加载时调用 ``engine.load``（在线程池中执行，避免阻塞事件循环）。
+    失败时抛 ``ModelAssetError``，由全局 handler 映射为 503。
+    """
+
+    if engine.is_loaded:
+        return
+    await asyncio.to_thread(engine.load)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -112,22 +161,22 @@ async def health() -> HealthResponse:
 
 
 @app.get("/api/speakers", response_model=list[SpeakerResponse])
-async def list_speakers() -> list[dict[str, object]]:
+async def list_speakers() -> list[SpeakerResponse]:
     """列出预置可用音色。"""
 
-    return speaker_registry.list_speakers()
+    return [
+        SpeakerResponse(id=item.id, seed=item.seed, display_name=item.display_name)
+        for item in speaker_registry.list_speakers()
+    ]
 
 
-@app.post("/api/speakers/random", response_model=SpeakerResponse)
+@app.post(
+    "/api/speakers/random",
+    response_model=SpeakerResponse,
+    dependencies=[Depends(ensure_engine_ready)],
+)
 async def random_speaker() -> SpeakerResponse:
     """采样一个新的随机音色，返回其 seed/id（可复现）。"""
-
-    if not engine.is_loaded:
-        # 采样依赖模型；未加载时尝试加载一次，仍失败则 503。
-        try:
-            await asyncio.to_thread(engine.load)
-        except ModelAssetError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     seed, _ = await asyncio.to_thread(speaker_registry.sample_new)
     return SpeakerResponse(id=str(seed), seed=seed, display_name=f"音色 #{seed}")
@@ -140,36 +189,23 @@ async def random_speaker() -> SpeakerResponse:
         400: {"description": "请求参数非法"},
         503: {"description": "服务繁忙或模型未就绪"},
     },
+    dependencies=[Depends(ensure_engine_ready)],
 )
 async def tts(request: TTSRequest) -> Response:
     """文本转语音，返回 WAV 音频字节流。"""
 
-    if not engine.is_loaded:
-        try:
-            await asyncio.to_thread(engine.load)
-        except ModelAssetError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    try:
-        # 并发门控：排队超时直接 503，保护显存不被过多并发请求压垮。
-        async with inference_gate.slot():
-            wav_bytes = await asyncio.to_thread(
-                engine.synthesize_wav_bytes,
-                request.text,
-                speaker=request.speaker,
-                speed=request.speed,
-                refine=request.refine,
-                temperature=request.temperature,
-                top_p=request.top_p,
-                top_k=request.top_k,
-            )
-    except QueueTimeoutError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except ModelAssetError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except (ValueError, SynthesisError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
+    # 并发门控：排队超时直接 503，保护显存不被过多并发请求压垮。
+    async with inference_gate.slot():
+        wav_bytes = await asyncio.to_thread(
+            engine.synthesize_wav_bytes,
+            request.text,
+            speaker=request.speaker,
+            speed=request.speed,
+            refine=request.refine,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k,
+        )
     return Response(content=wav_bytes, media_type="audio/wav")
 
 
@@ -208,39 +244,32 @@ async def tts_stream(payload: TTSRequest, request: Request) -> StreamingResponse
     3. 模型资产/就绪校验（``engine.load`` 失败 → 503 ``MODEL_ASSET_ERROR``）；
     4. 获取推理槽位（超时 → 503 ``QUEUE_TIMEOUT``）。
 
-    注入 ``fastapi.Request`` 用于断开检测（见 6.5）；请求体参数名用 ``payload``，避免与
-    ``request`` 冲突。
+    校验类异常（ValueError / ModelAssetError / QueueTimeoutError）直接抛出，由全局
+    exception handler 映射到对应 HTTP 状态码。
     """
 
     # 单次请求 id，用于把日志与一次流式会话关联起来。
     request_id = uuid.uuid4().hex[:8]
 
-    # 1+2. 音色显式校验与参数校验/切分：都在流开始前完成，失败统一映射为 400。
+    # 1+2. 音色显式校验与参数校验/切分：失败统一抛 ValueError → 全局 handler 400。
     #    流式接口用更小的 STREAM_MAX_SEGMENT_CHARS 切分，分片更多 → 首片更快到达、
     #    全程更流畅（代价是推理次数增多、总时长略升）。
-    try:
-        resolve_speaker(payload.speaker)
-        seed, selected_speed, segments = engine.plan_segments(
-            payload.text,
-            speaker=payload.speaker,
-            speed=payload.speed,
-            max_chars=settings.stream_max_segment_chars,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    parse_speaker(payload.speaker)
+    seed, selected_speed, segments = engine.plan_segments(
+        payload.text,
+        speaker=payload.speaker,
+        speed=payload.speed,
+        max_chars=settings.stream_max_segment_chars,
+    )
 
-    # 3. 模型资产/就绪校验：缺资产时返回 503，不进入 SSE。
-    try:
-        await asyncio.to_thread(engine.load)
-    except ModelAssetError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    # 3. 模型资产/就绪校验：缺资产时 ModelAssetError → 全局 handler 503。
+    await asyncio.to_thread(engine.load)
 
-    # 4. 进入 SSE 前获取推理槽位：超时返回 503（QUEUE_TIMEOUT）。
-    #    采用“整条流持有同一个槽位直到流结束”的方案 A（见 6.2），在生成器 finally 释放。
-    try:
-        await inference_gate.acquire()
-    except QueueTimeoutError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    # 4. 进入 SSE 前获取推理槽位：超时 QueueTimeoutError → 全局 handler 503。
+    #    采用“整条流持有同一个槽位直到流结束”的方案 A（见 6.2）。
+    await inference_gate.acquire()
+    # 注意：从 acquire 成功到 StreamingResponse 真正被消费之间，必须保证不再抛异常；
+    #     若新增同步初始化，请放进生成器的 try/finally 内，否则会泄漏槽位。
 
     total = len(segments)
     text_len = len(payload.text)
@@ -367,21 +396,28 @@ async def tts_stream(payload: TTSRequest, request: Request) -> StreamingResponse
     )
 
 
+def _index_or_hint(message: str) -> FileResponse | dict[str, str]:
+    """前端已构建则返回 index.html，否则给出提示。"""
+
+    if static_dir is None:
+        return {"message": message}
+    return FileResponse(static_dir / "index.html")
+
+
 @app.get("/", response_model=None)
 async def index() -> FileResponse | dict[str, str]:
     """返回 Web GUI；前端未构建时返回提示。"""
 
-    if static_dir is None:
-        return {"message": "前端尚未构建，请先运行 npm run build。API 可继续使用。"}
-    return FileResponse(static_dir / "index.html")
+    return _index_or_hint("前端尚未构建，请先运行 npm run build。API 可继续使用。")
 
 
 @app.get("/{path:path}", response_model=None)
 async def spa_fallback(path: str) -> FileResponse | dict[str, str]:
-    """单页应用兜底路由，刷新非根路径时仍返回 index.html。"""
+    """单页应用兜底路由，刷新非根路径时仍返回 index.html。
 
-    if path.startswith("api/") or path == "health":
+    显式排除 ``api/`` / ``health`` / FastAPI 内置文档路径，避免被 catch-all 吞掉。
+    """
+
+    if path.startswith("api/") or path == "health" or path in _FASTAPI_DOCS_PATHS:
         raise HTTPException(status_code=404, detail="Not Found")
-    if static_dir is None:
-        return {"message": "前端尚未构建，请先运行 npm run build。"}
-    return FileResponse(static_dir / "index.html")
+    return _index_or_hint("前端尚未构建，请先运行 npm run build。")

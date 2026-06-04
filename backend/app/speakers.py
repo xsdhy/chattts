@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import random
 import threading
+from dataclasses import dataclass
 from typing import Callable
 
 from .config import settings
@@ -28,6 +29,15 @@ _CURATED_SEEDS: tuple[int, ...] = (2, 7, 21, 42, 111, 333, 1024, 2048)
 
 # 随机 seed 的取值上限（32 位正整数范围），保证可被 torch.manual_seed 接受。
 _MAX_SEED = 2**31 - 1
+
+
+@dataclass(frozen=True)
+class SpeakerListEntry:
+    """供 `/api/speakers` 返回的最小音色项。"""
+
+    id: str
+    seed: int
+    display_name: str
 
 
 def _display_name(seed: int) -> str:
@@ -64,9 +74,10 @@ class SpeakerRegistry:
     def embedding_for_seed(self, seed: int) -> str:
         """返回给定 seed 对应的 speaker embedding（带缓存，保证可复现）。
 
-        实现要点：采样前用 ``torch.manual_seed(seed)`` 固定全局 RNG，使得
-        ``sample_random_speaker()`` 的输出只由 seed 决定，从而相同 seed 始终得到
-        相同 embedding。
+        采样前用 ``torch.manual_seed(seed)`` 固定全局 RNG，使 ``sample_random_speaker()``
+        的输出只由 seed 决定；**采样完成后立即把之前的 RNG 状态还原**，避免污染同进程
+        内后续的推理随机性（GPT 采样等也依赖全局 RNG，曾经造成“相同请求第一次/第二次
+        结果飘”或“合成结果与音色 seed 强相关”等不易复现的现象）。
 
         Raises:
             RuntimeError: 采样器尚未绑定（模型未加载）。
@@ -87,9 +98,19 @@ class SpeakerRegistry:
 
             import torch
 
-            # 固定全局随机数状态，保证 seed → embedding 可复现。
-            torch.manual_seed(seed)
-            embedding = self._sampler()
+            # 备份全局 RNG（CPU + 所有 CUDA 设备），采样后还原。
+            cpu_state = torch.random.get_rng_state()
+            cuda_states = (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            )
+            try:
+                torch.manual_seed(seed)
+                embedding = self._sampler()
+            finally:
+                torch.random.set_rng_state(cpu_state)
+                if cuda_states is not None:
+                    torch.cuda.set_rng_state_all(cuda_states)
+
             self._cache[seed] = embedding
             return embedding
 
@@ -109,7 +130,7 @@ class SpeakerRegistry:
 
         return self.config.default_speaker
 
-    def list_speakers(self) -> list[dict[str, object]]:
+    def list_speakers(self) -> list["SpeakerListEntry"]:
         """返回预置命名音色清单（含默认音色，去重并保持顺序）。
 
         仅返回元数据，不需要模型已加载——因此前端挂载时即可填充下拉框。
@@ -121,12 +142,12 @@ class SpeakerRegistry:
                 seeds.append(seed)
 
         return [
-            {
-                "id": str(seed),
-                "seed": seed,
-                "display_name": _display_name(seed)
+            SpeakerListEntry(
+                id=str(seed),
+                seed=seed,
+                display_name=_display_name(seed)
                 + ("（默认）" if seed == self.default_seed() else ""),
-            }
+            )
             for seed in seeds
         ]
 

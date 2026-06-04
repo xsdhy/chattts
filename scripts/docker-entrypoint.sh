@@ -12,8 +12,18 @@ MODEL_DIR="${MODEL_DIR:-/app/models}"
 MODELS_AUTO_DOWNLOAD="${MODELS_AUTO_DOWNLOAD:-1}"
 
 models_present() {
-  # ChatTTS custom 加载依赖 asset/ 子目录及其中权重文件。
-  [[ -d "${MODEL_DIR}/asset" ]] && [[ -n "$(ls -A "${MODEL_DIR}/asset" 2>/dev/null)" ]]
+  # ChatTTS custom 加载要求 asset/ 子目录中存在 Decoder / DVAE / GPT / Vocos 四个
+  # 关键权重，任一以 .pt 或 .safetensors 结尾的格式都接受。只检查 "asset/ 非空" 过宽，
+  # 残缺挂载会让加载阶段抛出难追溯的错误。
+  local asset_dir="${MODEL_DIR}/asset"
+  [[ -d "$asset_dir" ]] || return 1
+  local name
+  for name in Decoder DVAE GPT Vocos; do
+    if [[ ! -f "$asset_dir/$name.pt" && ! -f "$asset_dir/$name.safetensors" ]]; then
+      return 1
+    fi
+  done
+  return 0
 }
 
 if models_present; then

@@ -11,19 +11,6 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 from .config import settings
-from .speakers import parse_speaker
-
-
-def resolve_speaker(speaker: str | None) -> int:
-    """音色前置校验：把请求里的音色标识解析为整数 seed，非法时抛 ``ValueError``。
-
-    供流式接口 ``POST /api/tts/stream`` 在**进入 SSE 之前**显式调用，从而把“音色不存在/
-    非法”用标准 HTTP 400 反馈，而不是变成流内的 ``error`` 事件（见需求 5）。普通接口
-    则继续靠引擎内部解析时抛出的 ``ValueError`` 转 400。两者底层都复用
-    ``speakers.parse_speaker``，保证校验口径一致。
-    """
-
-    return parse_speaker(speaker)
 
 
 class TTSRequest(BaseModel):
@@ -45,14 +32,14 @@ class TTSRequest(BaseModel):
     @field_validator("text")
     @classmethod
     def validate_text(cls, value: str) -> str:
-        """校验文本非空且不超过最大长度。"""
+        """校验文本非空且不超过最大长度。不修剪原始值（由引擎层归一化）。"""
 
         stripped = value.strip()
         if not stripped:
             raise ValueError("文本不能为空")
         if len(stripped) > settings.max_text_len:
             raise ValueError(f"文本长度不能超过 {settings.max_text_len} 个字符")
-        return stripped
+        return value
 
 
 class SpeakerResponse(BaseModel):

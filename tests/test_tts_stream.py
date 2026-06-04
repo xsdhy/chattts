@@ -90,7 +90,7 @@ async def test_stream_success_event_order(monkeypatch):
         lambda text, *, speaker=None, speed=None, max_chars=None: (2, 1.0, ["一", "二", "三"]),
     )
 
-    slots_before = inference_gate._semaphore._value
+    slots_before = inference_gate.available
 
     async with _client() as client:
         resp = await client.post(
@@ -134,7 +134,7 @@ async def test_stream_success_event_order(monkeypatch):
     assert events[-1][1]["chunks"] == len(audio_events) == 3
 
     # 正常结束后推理槽位被释放，回到初始可用数。
-    assert inference_gate._semaphore._value == slots_before
+    assert inference_gate.available == slots_before
 
 
 async def test_unknown_speaker_returns_400():
@@ -216,7 +216,7 @@ async def test_disconnect_releases_slot(monkeypatch):
         "starlette.requests.Request.is_disconnected", _always_disconnected
     )
 
-    slots_before = inference_gate._semaphore._value
+    slots_before = inference_gate.available
 
     async with _client() as client:
         resp = await client.post(
@@ -233,7 +233,7 @@ async def test_disconnect_releases_slot(monkeypatch):
     assert "done" not in names
 
     # 断开路径同样在 finally 释放了槽位，未泄漏。
-    assert inference_gate._semaphore._value == slots_before
+    assert inference_gate.available == slots_before
 
 
 def test_stream_uses_smaller_segments_than_normal():
@@ -301,8 +301,20 @@ async def test_streamed_segments_match_full_synthesis(monkeypatch):
     # 完整合成（普通接口路径）。
     full = engine.synthesize("整段文本", speaker="2", speed=1.0)
 
-    # 逐段拼接（流式接口路径）。
-    streamed = list(engine.synthesize_segments("整段文本", speaker="2", speed=1.0))
+    # 逐段拼接（流式接口路径：plan_segments + synthesize_segment，与路由一致）。
+    seed, selected_speed, planned = engine.plan_segments(
+        "整段文本", speaker="2", speed=1.0, max_chars=settings.stream_max_segment_chars
+    )
+    streamed = [
+        engine.synthesize_segment(
+            seg,
+            idx,
+            len(planned),
+            seed=seed,
+            speed=selected_speed,
+        )
+        for idx, seg in enumerate(planned)
+    ]
     concatenated = np.concatenate([seg.samples for seg in streamed])
 
     assert full.sample_rate == 24000

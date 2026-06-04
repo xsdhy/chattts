@@ -4,7 +4,7 @@
 
 - 懒加载（线程安全双检锁）一次性构建 ``ChatTTS.Chat`` 实例，并探测 GPU/CPU；
 - 文本归一化、长文本切分（按中文标点 / 软断点 / 字数阈值，合并过短段）；
-- 逐段调用 ``chat.infer``（带 speaker embedding + 采样参数），段间插入静音；
+- 逐段调用 ``chat.infer``（带 speaker embedding + 采样参数），段间插入静音;
 - numpy 线性插值变速（不引入 ffmpeg/scipy）；
 - soundfile 编码 24kHz 单声道 WAV 字节。
 
@@ -14,18 +14,21 @@
 from __future__ import annotations
 
 import io
+import logging
 import re
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable
 
 import numpy as np
 import soundfile as sf
 
 from .config import Settings, settings
 from .speakers import parse_speaker, speaker_registry
+
+logger = logging.getLogger("chattts.engine")
 
 
 # ---- 异常层级（见需求 5.4）----
@@ -74,7 +77,8 @@ class ChatTTSEngine:
     """
 
     # 句末标点（硬断点）与软断点（逗号 / 顿号 / 空白）。
-    _sentence_break_re = re.compile(r"([。！？!?；;：:\n]+)")
+    # 注：归一化已把 \n 压成空格，因此 sentence_break 中不再包含 \n。
+    _sentence_break_re = re.compile(r"([。！？!?；;：:]+)")
     _soft_break_re = re.compile(r"([，,、\s]+)")
 
     def __init__(self, config: Settings = settings) -> None:
@@ -149,11 +153,12 @@ class ChatTTSEngine:
             speaker_registry.bind(chat.sample_random_speaker)
             speaker_registry.embedding_for_seed(self.config.default_speaker)
 
-            print(
-                f"[engine] ChatTTS 已加载：device={self._device} "
-                f"source={load_kwargs.get('source')} 耗时={elapsed:.1f}s "
-                f"default_speaker={self.config.default_speaker}",
-                flush=True,
+            logger.info(
+                "ChatTTS 已加载：device=%s source=%s 耗时=%.1fs default_speaker=%d",
+                self._device,
+                load_kwargs.get("source"),
+                elapsed,
+                self.config.default_speaker,
             )
 
     def _resolve_load_kwargs(self, device) -> dict:
@@ -249,11 +254,14 @@ class ChatTTSEngine:
 
         merged = np.concatenate(pieces)
         elapsed = time.monotonic() - started
-        print(
-            f"[engine] 合成完成：chars={len(text or '')} segments={total} "
-            f"speaker={seed} speed={selected_speed} refine={refine} "
-            f"耗时={elapsed:.2f}s",
-            flush=True,
+        logger.info(
+            "合成完成：chars=%d segments=%d speaker=%d speed=%s refine=%s 耗时=%.2fs",
+            len(text or ""),
+            total,
+            seed,
+            selected_speed,
+            refine,
+            elapsed,
         )
         return SynthesisResult(samples=merged, sample_rate=sample_rate)
 
@@ -361,50 +369,6 @@ class ChatTTSEngine:
             is_final=is_final,
         )
 
-    def synthesize_segments(
-        self,
-        text: str,
-        *,
-        speaker: str | None = None,
-        speed: float | None = None,
-        refine: bool = False,
-        temperature: float = 0.3,
-        top_p: float = 0.7,
-        top_k: int = 20,
-    ) -> Iterator[SegmentSynthesis]:
-        """逐段产出生成器：每段产出一个 ``SegmentSynthesis``。
-
-        复用 ``plan_segments``（校验+切分）与 ``synthesize_segment``（单段合成+段间
-        静音）。这是一个**同步生成器**，每次 ``next()`` 只合成一个分段，因此路由层可以
-        把每段推理放到线程池执行，并在两段之间让出控制权及时 flush SSE 事件。
-
-        路由层目前直接使用 ``plan_segments`` + ``synthesize_segment`` 以便在每段前后
-        插入进度事件与断开检测；本生成器作为等价的可复用封装一并提供。它与流式路由
-        保持一致，使用更小的 ``STREAM_MAX_SEGMENT_CHARS`` 切分。
-        """
-
-        seed, selected_speed, segments = self.plan_segments(
-            text,
-            speaker=speaker,
-            speed=speed,
-            max_chars=self.config.stream_max_segment_chars,
-        )
-        self.load()
-
-        total = len(segments)
-        for index, segment in enumerate(segments):
-            yield self.synthesize_segment(
-                segment,
-                index,
-                total,
-                seed=seed,
-                speed=selected_speed,
-                refine=refine,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            )
-
     def synthesize_wav_bytes(
         self,
         text: str,
@@ -493,7 +457,11 @@ class ChatTTSEngine:
 
     @staticmethod
     def _validate_speed(speed: float) -> float:
-        """校验语速范围 0.5~2.0。"""
+        """校验语速范围 0.5~2.0。
+
+        Schema 已通过 Pydantic 约束做过一次校验；这里再做一次是因为 ``synthesize``
+        也被脚本/测试直接调用，绕过了 schema。属于有意冗余的纵深防御。
+        """
 
         value = float(speed)
         if value < 0.5 or value > 2.0:
@@ -504,17 +472,28 @@ class ChatTTSEngine:
 # ---------------------------------------------------------------------- #
 # 模块级工具函数
 # ---------------------------------------------------------------------- #
+# ChatTTS custom 加载所需的关键资产（任一格式存在即可）。
+_REQUIRED_ASSETS: tuple[str, ...] = ("Decoder", "DVAE", "GPT", "Vocos")
+
+
 def _model_dir_ready(model_dir: Path) -> bool:
     """判断本地模型目录是否可用于 ``source="custom"`` 加载。
 
-    ChatTTS 自定义路径要求目录下存在 ``asset/`` 子目录且非空（GPT/DVAE/Vocos 等
-    权重都在其中）。这里只做轻量存在性探测，真正合法性交给 ``chat.load``。
+    ChatTTS 自定义路径要求 ``asset/`` 子目录下包含 GPT / DVAE / Decoder / Vocos
+    等关键权重文件（任一以 ``.pt`` 或 ``.safetensors`` 结尾的格式都接受）。
+    只检查“asset 目录非空”过于宽松，残缺挂载会让加载阶段抛出难追溯的错误。
     """
 
     asset_dir = model_dir / "asset"
     if not asset_dir.is_dir():
         return False
-    return any(asset_dir.iterdir())
+    for name in _REQUIRED_ASSETS:
+        if not (
+            (asset_dir / f"{name}.pt").exists()
+            or (asset_dir / f"{name}.safetensors").exists()
+        ):
+            return False
+    return True
 
 
 def split_text(text: str, *, max_chars: int = 120) -> list[str]:
@@ -623,18 +602,16 @@ def _merge_short_segments(segments: Iterable[str], *, max_chars: int) -> list[st
 def _to_mono_float32(samples: np.ndarray) -> np.ndarray:
     """统一音频数组为 float32 单声道一维数组。
 
-    ChatTTS 输出可能是 ``(T,)`` 或 ``(1, T)``；这里先 squeeze，再对仍是二维的情况
-    按“较短轴为声道”启发式取均值，避免拼接时 dtype/shape 不一致。
+    ChatTTS ``infer`` 返回一维 PCM 或 ``(1, T)`` 形状；``np.squeeze`` 会去掉单维。
+    squeeze 后仍 ndim==2 的情况理论上不应出现（约定为 ``(channels, T)``），但为
+    保守起见仍取声道维均值。零维标量被还原为长度 1 的数组。
     """
 
     array = np.asarray(samples, dtype=np.float32)
     array = np.squeeze(array)
     if array.ndim == 2:
-        # 行数远小于列数 → 形如 (channels, T)，对声道维求均值；反之对列求均值。
-        if array.shape[0] <= array.shape[1]:
-            array = array.mean(axis=0)
-        else:
-            array = array.mean(axis=1)
+        # 显式约定：ChatTTS 输出多通道时形状为 (channels, T)。
+        array = array.mean(axis=0)
     elif array.ndim == 0:
         array = array.reshape(1)
     return np.ascontiguousarray(array.astype(np.float32))
@@ -658,6 +635,9 @@ def _change_speed(samples: np.ndarray, speed: float) -> np.ndarray:
         return samples
 
     source = _to_mono_float32(samples)
+    if source.size == 0:
+        # 空音频不做插值，避免 np.interp 抛错。
+        return source
     target_length = max(1, int(round(len(source) / speed)))
     if len(source) <= 1 or target_length == len(source):
         return source

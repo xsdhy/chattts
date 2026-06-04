@@ -47,9 +47,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libsndfile1 curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# torch 已由基础镜像提供；从 requirements 中剔除 torch 行后再安装，避免覆盖 GPU 版。
+# torch 已由基础镜像提供；从 requirements 中剔除“裸 torch”行后再安装，避免覆盖
+# GPU 版。锚定后的下划线/数字/分隔符仅匹配独立的 `torch` 包，确保 torchaudio /
+# torchvision / torchtext 等真正需要安装的依赖不被误剔除。
 COPY backend/requirements.txt ./requirements.txt
-RUN grep -ivE '^torch' requirements.txt > requirements.notorch.txt \
+RUN grep -ivE '^torch([[:space:]<>=!,;]|$)' requirements.txt > requirements.notorch.txt \
     && pip install --no-cache-dir -r requirements.notorch.txt
 
 COPY backend/app ./app

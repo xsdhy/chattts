@@ -25,7 +25,6 @@
 ├── Dockerfile.gpu             # GPU 形态（CUDA 基础镜像）
 ├── docker-compose.yml         # 含 GPU 示例与模型挂载
 ├── README.md                  # 主文档：用法 + 架构 + API + FAQ
-├── docs/                       # 需求文档（SSE 流式接口需求等）
 ├── conftest.py                # pytest 路径夹具（backend.app.* 导入）
 ├── pytest.ini                 # pytest 配置
 ├── backend/
@@ -123,8 +122,10 @@ ValueError               # 参数/音色非法      → 400
 
 ### 音色管理（ChatTTS 特色）
 
-- 调用 `chat.sample_random_speaker()` 采样 speaker embedding；采样前 `torch.manual_seed(seed)`
-  固定全局随机数状态，使**相同 seed → 相同 embedding**，从而音色可复现。
+- 调用 `chat.sample_random_speaker()` 采样 speaker embedding；采样前用
+  `torch.manual_seed(seed)` 钉死全局 RNG，使**相同 seed → 相同 embedding**，从而音色可
+  复现。采样**结束后立即用 `set_rng_state` 还原 CPU + 所有 CUDA 设备的 RNG 状态**，
+  避免污染后续 GPT / DVAE 采样的随机性。
 - 以整数 `seed` 作为音色 id，进程内缓存 `seed → embedding`，避免重复计算。
 - 启动时固定 `DEFAULT_SPEAKER` 作为默认音色；`POST /api/speakers/random` 每次返回新 seed，
   前端可试听后固定。
@@ -166,7 +167,7 @@ docker build -f Dockerfile.gpu -t xsdhy/chattts:gpu .   # GPU
 ### 1. 准备 Python 虚拟环境
 
 ```bash
-python3.11 -m venv .venv
+python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r backend/requirements.txt
 ```

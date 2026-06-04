@@ -82,6 +82,12 @@ export function decodeWav(bytes: Uint8Array): DecodedWav {
   if (dataOffset < 0) {
     throw new Error("WAV 分片缺少 data chunk");
   }
+  if (dataOffset + dataLength > bytes.byteLength) {
+    // 防御被截断的 WAV：直接拒绝而不是静默截短数据，避免产生末尾杂音。
+    throw new Error(
+      `WAV data chunk 越界：需要 ${dataOffset + dataLength} 字节，但只有 ${bytes.byteLength}`,
+    );
+  }
 
   // 把 data 字节拷贝到独立缓冲，避免 Int16Array 对未对齐 offset 的限制。
   const dataBytes = bytes.slice(dataOffset, dataOffset + dataLength);
@@ -98,6 +104,9 @@ export function decodeWav(bytes: Uint8Array): DecodedWav {
  * 把若干 16-bit PCM 分片按顺序拼接，封装为一个完整的 PCM_16 单声道 WAV Blob。
  *
  * 用于“流式完成后下载完整音频”：保持与后端一致的采样率，不经过任何重采样。
+ *
+ * 说明：WAV 数据区采用小端字节序。所有主流浏览器运行环境（x86 / ARM）的 Int16Array
+ * 也是小端，因此可以直接 `Int16Array.set` 批量写入，避免逐采样 `setInt16` 的开销。
  */
 export function encodeWav(chunks: Int16Array[], sampleRate: number): Blob {
   const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
@@ -131,13 +140,12 @@ export function encodeWav(chunks: Int16Array[], sampleRate: number): Blob {
   writeAscii(36, "data");
   view.setUint32(40, dataSize, true);
 
-  // 顺序写入各分片 PCM 数据。
-  let offset = 44;
+  // 一次性把所有分片 PCM 写入数据区（小端 host 假设）。
+  const pcmView = new Int16Array(buffer, 44, totalSamples);
+  let writeOffset = 0;
   for (const chunk of chunks) {
-    for (let i = 0; i < chunk.length; i += 1) {
-      view.setInt16(offset, chunk[i], true);
-      offset += 2;
-    }
+    pcmView.set(chunk, writeOffset);
+    writeOffset += chunk.length;
   }
 
   return new Blob([buffer], { type: "audio/wav" });

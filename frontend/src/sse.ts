@@ -11,12 +11,15 @@ export type SseEvent = {
   data: string;
 };
 
+/** 同时兼容 LF 与 CRLF 事件分隔符，避免对整个 buffer 做 O(n²) 的字符串替换。 */
+const EVENT_DELIMITER_RE = /\r?\n\r?\n/;
+
 /**
  * 把 `fetch` 响应体（字节流）解析为 SSE 事件的异步迭代器。
  *
- * SSE 线格式：事件之间用空行（`\n\n`）分隔；事件内 `event:` 与 `data:` 各占一行。
- * 这里按“空行”切分事件块，并把同一块内的多行 `data:` 用换行拼接（后端为单行 data，
- * 但按规范做兼容处理）。
+ * SSE 线格式：事件之间用空行（`\n\n` 或 `\r\n\r\n`）分隔；事件内 `event:` 与
+ * `data:` 各占一行。这里按空行切分事件块，并把同一块内的多行 `data:` 用换行
+ * 拼接（后端为单行 data，但按规范做兼容处理）。
  */
 export async function* parseSseStream(
   body: ReadableStream<Uint8Array>,
@@ -38,18 +41,17 @@ export async function* parseSseStream(
 
       buffer += decoder.decode(value, { stream: true });
 
-      // 统一换行符后按空行切分出完整事件块；最后一段可能不完整，留在 buffer。
-      buffer = buffer.replace(/\r\n/g, "\n");
-      let separatorIndex = buffer.indexOf("\n\n");
-      while (separatorIndex !== -1) {
+      let match = buffer.match(EVENT_DELIMITER_RE);
+      while (match) {
+        const separatorIndex = match.index ?? 0;
         const rawBlock = buffer.slice(0, separatorIndex);
-        buffer = buffer.slice(separatorIndex + 2);
+        buffer = buffer.slice(separatorIndex + match[0].length);
 
         const parsed = parseEventBlock(rawBlock);
         if (parsed) {
           yield parsed;
         }
-        separatorIndex = buffer.indexOf("\n\n");
+        match = buffer.match(EVENT_DELIMITER_RE);
       }
     }
   } finally {
@@ -67,11 +69,13 @@ function parseEventBlock(block: string): SseEvent | null {
   let event = "message";
   const dataLines: string[] = [];
 
-  for (const line of block.split("\n")) {
+  // 兼容 LF / CRLF 的行分隔。
+  for (const line of block.split(/\r?\n/)) {
     if (line.startsWith("event:")) {
-      event = line.slice("event:".length).trim();
+      // SSE 规范：字段名后允许有一个可选前导空格作为分隔符。
+      event = line.slice("event:".length).replace(/^ /, "");
     } else if (line.startsWith("data:")) {
-      dataLines.push(line.slice("data:".length).trim());
+      dataLines.push(line.slice("data:".length).replace(/^ /, ""));
     }
     // 以 ":" 开头的注释行与其它字段按需忽略。
   }
