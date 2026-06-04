@@ -253,13 +253,15 @@ async def tts_stream(payload: TTSRequest, request: Request) -> StreamingResponse
 
     # 1+2. 音色显式校验与参数校验/切分：失败统一抛 ValueError → 全局 handler 400。
     #    流式接口用更小的 STREAM_MAX_SEGMENT_CHARS 切分，分片更多 → 首片更快到达、
-    #    全程更流畅（代价是推理次数增多、总时长略升）。
+    #    全程更流畅（代价是推理次数增多、总时长略升）。客户端可通过 payload.max_segment_chars
+    #    覆盖该默认值，schema 已限定范围 10~500。
     parse_speaker(payload.speaker)
+    max_chars = payload.max_segment_chars or settings.stream_max_segment_chars
     seed, selected_speed, segments = engine.plan_segments(
         payload.text,
         speaker=payload.speaker,
         speed=payload.speed,
-        max_chars=settings.stream_max_segment_chars,
+        max_chars=max_chars,
     )
 
     # 3. 模型资产/就绪校验：缺资产时 ModelAssetError → 全局 handler 503。

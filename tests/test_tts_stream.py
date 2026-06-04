@@ -258,6 +258,62 @@ def test_stream_uses_smaller_segments_than_normal():
     assert all(len(seg) <= settings.stream_max_segment_chars for seg in stream)
 
 
+async def test_stream_respects_request_max_segment_chars(monkeypatch):
+    """请求体的 ``max_segment_chars`` 应覆盖默认 ``STREAM_MAX_SEGMENT_CHARS``。
+
+    构造一段长文本，分别用 ``max_segment_chars=20`` 和 ``max_segment_chars=100`` 请求，
+    断言更小的上限产出更多 audio 事件。
+    """
+
+    text = "你好，欢迎使用流式语音合成服务，" * 5 + "希望第一声尽快出来。"
+
+    async with _client() as client:
+        small = await client.post(
+            "/api/tts/stream",
+            json={
+                "text": text,
+                "speaker": "2",
+                "speed": 1.0,
+                "format": "wav",
+                "max_segment_chars": 20,
+            },
+        )
+        big = await client.post(
+            "/api/tts/stream",
+            json={
+                "text": text,
+                "speaker": "2",
+                "speed": 1.0,
+                "format": "wav",
+                "max_segment_chars": 100,
+            },
+        )
+
+    assert small.status_code == 200
+    assert big.status_code == 200
+    small_audio = [n for n, _ in _parse_sse(small.text) if n == "audio"]
+    big_audio = [n for n, _ in _parse_sse(big.text) if n == "audio"]
+    assert len(small_audio) > len(big_audio)
+
+
+async def test_stream_rejects_out_of_range_max_segment_chars():
+    """``max_segment_chars`` 超出 schema 限定的 10~500 时返回 400。"""
+
+    async with _client() as client:
+        resp = await client.post(
+            "/api/tts/stream",
+            json={
+                "text": "你好",
+                "speaker": "2",
+                "speed": 1.0,
+                "format": "wav",
+                "max_segment_chars": 5,
+            },
+        )
+
+    assert resp.status_code == 400
+
+
 async def test_streamed_segments_match_full_synthesis(monkeypatch):
     """段间静音一致性（需求 9.9）：
 

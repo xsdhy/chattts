@@ -503,3 +503,10 @@ audio {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
+
+/* 字段次要说明（如”分片大小 · 越小首响越快”） */
+.field span .hint {
+  margin-left: 6px;
+  color: var(--ink-5);
+  font-weight: 400;
+}

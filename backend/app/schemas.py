@@ -28,6 +28,14 @@ class TTSRequest(BaseModel):
     top_p: float = Field(default=0.7, gt=0.0, le=1.0, description="nucleus 采样阈值")
     top_k: int = Field(default=20, ge=1, le=100, description="top-k 采样候选数")
     format: Literal["wav"] = Field(default="wav", description="当前仅支持 WAV")
+    # 流式分片上限：仅对 /api/tts/stream 生效；普通 /api/tts 忽略此字段。
+    # 缺省走配置 STREAM_MAX_SEGMENT_CHARS；调小让首片更快、调大让推理更连贯。
+    max_segment_chars: int | None = Field(
+        default=None,
+        ge=10,
+        le=500,
+        description="流式接口分片字符上限（10~500），仅对 /api/tts/stream 生效",
+    )
 
     @field_validator("text")
     @classmethod

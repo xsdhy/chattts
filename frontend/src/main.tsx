@@ -70,6 +70,11 @@ type StreamStage =
 const MAX_TEXT_LEN = 2000;
 const DEFAULT_TEXT = "你好，欢迎使用 ChatTTS 中文语音合成服务。";
 
+// 流式分片字符上限的可调范围；与后端 schema 约束（10~500）保持一致。
+const STREAM_CHUNK_MIN = 10;
+const STREAM_CHUNK_MAX = 200;
+const STREAM_CHUNK_DEFAULT = 50;
+
 function App() {
   // ---- 文本与音色 ----
   const [text, setText] = React.useState(DEFAULT_TEXT);
@@ -80,6 +85,18 @@ function App() {
   // ---- 基础参数 ----
   const [speed, setSpeed] = React.useState(1);
   const [mode, setMode] = React.useState<Mode>("normal");
+  // 流式分片字符上限：从 localStorage 读取，缺省 50。
+  const [streamChunkChars, setStreamChunkChars] = React.useState<number>(() => {
+    try {
+      const raw = localStorage.getItem("chattts.streamChunkChars");
+      if (!raw) return STREAM_CHUNK_DEFAULT;
+      const v = Number(raw);
+      if (!Number.isFinite(v)) return STREAM_CHUNK_DEFAULT;
+      return Math.max(STREAM_CHUNK_MIN, Math.min(STREAM_CHUNK_MAX, Math.round(v)));
+    } catch {
+      return STREAM_CHUNK_DEFAULT;
+    }
+  });
 
   // ---- 高级参数（折叠区）----
   const [showAdvanced, setShowAdvanced] = React.useState(false);
@@ -110,6 +127,15 @@ function App() {
   // 流式相关的可变引用：当前请求的中止控制器与播放器实例。
   const abortRef = React.useRef<AbortController | null>(null);
   const playerRef = React.useRef<StreamingAudioPlayer | null>(null);
+
+  // streamChunkChars 持久化到 localStorage（隐私模式失败时静默忽略）。
+  React.useEffect(() => {
+    try {
+      localStorage.setItem("chattts.streamChunkChars", String(streamChunkChars));
+    } catch {
+      // ignore
+    }
+  }, [streamChunkChars]);
 
   // 挂载时拉取音色列表与健康状态。
   React.useEffect(() => {
@@ -201,9 +227,9 @@ function App() {
     }
   }
 
-  /** 当前请求体：两种模式共用同一组参数。 */
-  function requestBody() {
-    return {
+  /** 当前请求体：两种模式共用同一组参数；流式模式追加分片大小参数。 */
+  function requestBody(includeChunkSize: boolean) {
+    const base: Record<string, unknown> = {
       text,
       speaker,
       speed,
@@ -213,6 +239,10 @@ function App() {
       top_k: topK,
       format: "wav",
     };
+    if (includeChunkSize) {
+      base.max_segment_chars = streamChunkChars;
+    }
+    return base;
   }
 
   /** 设置新的音频 URL，并 revoke 旧的，避免内存泄漏。 */
@@ -263,7 +293,7 @@ function App() {
       const response = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody()),
+        body: JSON.stringify(requestBody(false)),
       });
 
       if (!response.ok) {
@@ -328,7 +358,7 @@ function App() {
           "Content-Type": "application/json",
           Accept: "text/event-stream",
         },
-        body: JSON.stringify(requestBody()),
+        body: JSON.stringify(requestBody(true)),
         signal: controller.signal,
       });
 
@@ -443,6 +473,7 @@ function App() {
     setStage("idle");
     setPlayingIndex(null);
   }
+
 
   /** 点击生成：按当前模式分派到普通或流式生成。 */
   function handleGenerate() {
@@ -603,6 +634,26 @@ function App() {
                 onChange={(event) => setSpeed(Number(event.target.value))}
               />
             </label>
+
+            {mode === "stream" && (
+              <label className="field">
+                <span>
+                  分片大小 {streamChunkChars} 字
+                  <span className="hint"> · 越小首响越快</span>
+                </span>
+                <input
+                  type="range"
+                  min={STREAM_CHUNK_MIN}
+                  max={STREAM_CHUNK_MAX}
+                  step={5}
+                  value={streamChunkChars}
+                  disabled={controlsDisabled}
+                  onChange={(event) =>
+                    setStreamChunkChars(Number(event.target.value))
+                  }
+                />
+              </label>
+            )}
 
             <div className="advanced">
               <button
