@@ -10,7 +10,16 @@
  * - 首个分片到达即起播，不等待 `done`。
  * - 看门狗：若 pending 中堆积了分片但 `nextExpectedIndex` 长时间未推进，触发 stuck
  *   回调，让上层主动中止流并提示用户，避免“播放永远卡住”的静默失败。
+ *
+ * UI 协作：
+ * - 通过 onChunkPlayStart / onChunkPlayEnd 回调把“当前播到第几段”反馈给 UI。
+ * - 通过 getBufferedAhead() 查询“剩余缓冲秒数”，UI 可据此显示缓冲健康度。
  */
+export type StreamingPlayerCallbacks = {
+  onChunkPlayStart?: (index: number) => void;
+  onChunkPlayEnd?: (index: number) => void;
+};
+
 export class StreamingAudioPlayer {
   private context: AudioContext | null = null;
   /** 下一段音频应当开始播放的 AudioContext 时间（秒）。 */
@@ -21,10 +30,18 @@ export class StreamingAudioPlayer {
   private readonly pending = new Map<number, AudioBuffer>();
   /** 已排程但尚未播放完的源节点，用于取消时统一停止。 */
   private readonly scheduledSources = new Set<AudioBufferSourceNode>();
+  /** “即将开始播放”定时器集合，用于取消时清理。 */
+  private readonly scheduledStartTimers = new Set<ReturnType<typeof setTimeout>>();
 
+  private callbacks: StreamingPlayerCallbacks = {};
   private stuckHandler: (() => void) | null = null;
   private stuckTimeoutMs = 30_000;
   private watchdog: ReturnType<typeof setTimeout> | null = null;
+
+  /** 注册播放状态回调（用于驱动 UI 的“正在播放第 N 段”/“播放完成”）。 */
+  setCallbacks(callbacks: StreamingPlayerCallbacks): void {
+    this.callbacks = callbacks;
+  }
 
   /**
    * 注册“分片缺失超时”回调：当 `pending` 中有分片但 `nextExpectedIndex` 长时间
@@ -33,6 +50,14 @@ export class StreamingAudioPlayer {
   setStuckHandler(handler: () => void, timeoutMs = 30_000): void {
     this.stuckHandler = handler;
     this.stuckTimeoutMs = timeoutMs;
+  }
+
+  /** AudioContext.currentTime - nextStartTime：剩余可播放秒数（缓冲健康度）。 */
+  getBufferedAhead(): number {
+    if (!this.context) {
+      return 0;
+    }
+    return Math.max(0, this.nextStartTime - this.context.currentTime);
   }
 
   /** 延迟创建 AudioContext：必须在用户手势（点击生成）后创建/恢复才能发声。 */
@@ -96,8 +121,9 @@ export class StreamingAudioPlayer {
     }
 
     while (this.pending.has(this.nextExpectedIndex)) {
-      const buffer = this.pending.get(this.nextExpectedIndex)!;
-      this.pending.delete(this.nextExpectedIndex);
+      const index = this.nextExpectedIndex;
+      const buffer = this.pending.get(index)!;
+      this.pending.delete(index);
       this.nextExpectedIndex += 1;
 
       const source = context.createBufferSource();
@@ -110,8 +136,21 @@ export class StreamingAudioPlayer {
       this.nextStartTime = startAt + buffer.duration;
 
       this.scheduledSources.add(source);
+
+      // 在“即将开始播放”的那一刻通知 UI 该 index 进入播放状态。
+      const delayMs = Math.max(0, (startAt - context.currentTime) * 1000);
+      const onStart = this.callbacks.onChunkPlayStart;
+      if (onStart) {
+        const timer = setTimeout(() => {
+          this.scheduledStartTimers.delete(timer);
+          onStart(index);
+        }, delayMs);
+        this.scheduledStartTimers.add(timer);
+      }
+
       source.onended = () => {
         this.scheduledSources.delete(source);
+        this.callbacks.onChunkPlayEnd?.(index);
       };
     }
 
@@ -145,6 +184,10 @@ export class StreamingAudioPlayer {
   /** 停止播放并释放资源（用于取消或开始新一轮生成前清理）。 */
   stop(): void {
     this.clearWatchdog();
+    for (const timer of this.scheduledStartTimers) {
+      clearTimeout(timer);
+    }
+    this.scheduledStartTimers.clear();
     for (const source of this.scheduledSources) {
       try {
         source.stop();
@@ -156,6 +199,7 @@ export class StreamingAudioPlayer {
     this.scheduledSources.clear();
     this.pending.clear();
     this.nextExpectedIndex = 0;
+    this.callbacks = {};
 
     if (this.context) {
       void this.context.close();

@@ -36,6 +36,36 @@ type Health = {
   queue_timeout: number;
 };
 
+/**
+ * 单个分片在 UI 中的状态：
+ * - pending  : 后端 progress 事件已声明，但音频还未到达
+ * - received : 音频已到达且已入队播放器，但还轮不到播
+ * - playing  : 正在通过扬声器播放
+ * - played   : 已播放完毕
+ */
+type ChunkState = "pending" | "received" | "playing" | "played";
+
+type ChunkInfo = {
+  index: number;
+  state: ChunkState;
+  /** 该分片实际音频时长（毫秒），用于按比例渲染时间线宽度。 */
+  durationMs: number;
+};
+
+/**
+ * 流式生成的整体阶段，用于驱动顶部步进器：
+ * connecting → synthesizing → playing → finalizing → done
+ * 出错时直接落到 "error"。
+ */
+type StreamStage =
+  | "idle"
+  | "connecting"
+  | "synthesizing"
+  | "playing"
+  | "finalizing"
+  | "done"
+  | "error";
+
 // 与后端 MAX_TEXT_LEN 默认值保持一致；超过会被后端拒绝。
 const MAX_TEXT_LEN = 2000;
 const DEFAULT_TEXT = "你好，欢迎使用 ChatTTS 中文语音合成服务。";
@@ -66,6 +96,16 @@ function App() {
   const [error, setError] = React.useState("");
   const [audioUrl, setAudioUrl] = React.useState("");
   const [audioBlob, setAudioBlob] = React.useState<Blob | null>(null);
+
+  // ---- 流式可视化状态 ----
+  const [stage, setStage] = React.useState<StreamStage>("idle");
+  const [chunks, setChunks] = React.useState<ChunkInfo[]>([]);
+  /** TTFB：从点击生成到收到第一段音频的毫秒。仅在流式模式下有意义。 */
+  const [ttfbMs, setTtfbMs] = React.useState<number | null>(null);
+  /** 当前正在播放的分片 index（驱动“正在播”的高亮效果）。 */
+  const [playingIndex, setPlayingIndex] = React.useState<number | null>(null);
+  /** 已缓冲秒数（来自 player.getBufferedAhead），由 rAF 拉取。 */
+  const [bufferedAhead, setBufferedAhead] = React.useState(0);
 
   // 流式相关的可变引用：当前请求的中止控制器与播放器实例。
   const abortRef = React.useRef<AbortController | null>(null);
@@ -121,6 +161,21 @@ function App() {
     };
   }, []);
 
+  /** 当播放器存在时，每帧采样 bufferedAhead，给 UI 显示缓冲健康度。 */
+  React.useEffect(() => {
+    if (!isGenerating && stage !== "playing" && stage !== "finalizing") {
+      return;
+    }
+    // 250ms 拉一次足够展示缓冲变化，避免每帧渲染抖动。
+    const id = setInterval(() => {
+      const player = playerRef.current;
+      if (player) {
+        setBufferedAhead(player.getBufferedAhead());
+      }
+    }, 250);
+    return () => clearInterval(id);
+  }, [isGenerating, stage]);
+
   const charCount = text.trim().length;
   const canGenerate = charCount > 0 && Boolean(speaker) && !isGenerating;
 
@@ -170,13 +225,33 @@ function App() {
     });
   }
 
-  /** 开始新一轮生成前的统一清理：中止旧请求、停止旧播放、清空错误。 */
+  /** 开始新一轮生成前的统一清理：中止旧请求、停止旧播放、清空错误与可视化状态。 */
   function prepareNewRun() {
     abortRef.current?.abort();
     abortRef.current = null;
     playerRef.current?.stop();
     playerRef.current = null;
     setError("");
+    setChunks([]);
+    setTtfbMs(null);
+    setPlayingIndex(null);
+    setBufferedAhead(0);
+    setStage("idle");
+  }
+
+  /** 把分片更新为指定状态（不存在时新建条目）。 */
+  function patchChunk(index: number, patch: Partial<ChunkInfo>) {
+    setChunks((prev) => {
+      const next = [...prev];
+      const i = next.findIndex((c) => c.index === index);
+      if (i === -1) {
+        next.push({ index, state: "pending", durationMs: 0, ...patch });
+      } else {
+        next[i] = { ...next[i], ...patch };
+      }
+      next.sort((a, b) => a.index - b.index);
+      return next;
+    });
   }
 
   /** 普通生成：调用 `POST /api/tts`，一次性拿到完整 WAV。 */
@@ -213,11 +288,26 @@ function App() {
   async function generateStream() {
     prepareNewRun();
     setIsGenerating(true);
+    setStage("connecting");
     setStatusLabel("连接中");
 
+    const t0 = performance.now();
     const controller = new AbortController();
     abortRef.current = controller;
     const player = new StreamingAudioPlayer();
+    // 把“正在播放第几段”反馈到 UI，驱动时间线高亮 + 当前段标签。
+    player.setCallbacks({
+      onChunkPlayStart: (index) => {
+        setPlayingIndex(index);
+        patchChunk(index, { state: "playing" });
+        // 首段开始播放才正式进入 playing 阶段（之前可能仍在 synthesizing）。
+        setStage((prev) => (prev === "playing" || prev === "finalizing" ? prev : "playing"));
+      },
+      onChunkPlayEnd: (index) => {
+        patchChunk(index, { state: "played" });
+        setPlayingIndex((curr) => (curr === index ? null : curr));
+      },
+    });
     // 看门狗：30s 内 pending 仍未推进时，主动中止流并提示用户。
     player.setStuckHandler(() => {
       controller.abort();
@@ -229,6 +319,7 @@ function App() {
     const pcmChunks: { index: number; pcm: Int16Array }[] = [];
     // 以 start / 首个分片的采样率为准，作为最终下载 WAV 的采样率。
     let streamSampleRate = 0;
+    let firstAudioSeen = false;
 
     try {
       const response = await fetch("/api/tts/stream", {
@@ -250,6 +341,10 @@ function App() {
         throw new Error("流式生成中断，请重试");
       }
 
+      // 收到 200 响应即视为合成开始。
+      setStage("synthesizing");
+      setStatusLabel("准备合成");
+
       for await (const evt of parseSseStream(response.body, controller.signal)) {
         if (evt.event === "start") {
           const data = JSON.parse(evt.data) as { sample_rate?: number };
@@ -258,7 +353,20 @@ function App() {
           }
         } else if (evt.event === "progress") {
           const data = JSON.parse(evt.data) as { current: number; total: number };
-          setStatusLabel(`生成 ${data.current}/${data.total}`);
+          // 后端 current 从 1 开始；提前为所有 index 初始化占位，确保时间线长度立刻完整。
+          if (data.total > 0) {
+            setChunks((prev) => {
+              if (prev.length >= data.total) {
+                return prev;
+              }
+              const next = [...prev];
+              for (let i = next.length; i < data.total; i += 1) {
+                next.push({ index: i, state: "pending", durationMs: 0 });
+              }
+              return next;
+            });
+          }
+          setStatusLabel(`合成 ${data.current}/${data.total}`);
         } else if (evt.event === "audio") {
           const data = JSON.parse(evt.data) as {
             index: number;
@@ -279,8 +387,17 @@ function App() {
           // 暂存原始 PCM（下载用），并把解码后的 Float32 入队播放（播放用）。
           pcmChunks.push({ index: data.index, pcm: decoded.pcm });
           player.enqueue(data.index, pcm16ToFloat32(decoded.pcm), decoded.sampleRate);
+
+          const durationMs = (decoded.pcm.length / decoded.sampleRate) * 1000;
+          patchChunk(data.index, { state: "received", durationMs });
+
+          if (!firstAudioSeen) {
+            firstAudioSeen = true;
+            setTtfbMs(performance.now() - t0);
+          }
           setStatusLabel("播放中");
         } else if (evt.event === "done") {
+          setStage("finalizing");
           setStatusLabel("整理音频");
           // 按 index 排序后用统一采样率重组完整 WAV（不经过 AudioContext 重采样）。
           pcmChunks.sort((a, b) => a.index - b.index);
@@ -295,12 +412,15 @@ function App() {
           throw new Error(data.detail || "流式生成失败");
         }
       }
+      setStage("done");
     } catch (err) {
       // 用户主动取消：不展示错误，仅回到可编辑状态。
       if (controller.signal.aborted) {
         player.stop();
+        setStage("idle");
       } else {
         player.stop();
+        setStage("error");
         setError(err instanceof Error ? err.message : "流式生成中断，请重试");
       }
     } finally {
@@ -320,6 +440,8 @@ function App() {
     setIsGenerating(false);
     setStatusLabel("");
     setError("");
+    setStage("idle");
+    setPlayingIndex(null);
   }
 
   /** 点击生成：按当前模式分派到普通或流式生成。 */
@@ -364,6 +486,14 @@ function App() {
       : "生成中"
     : "生成";
 
+  const totalChunks = chunks.length;
+  const receivedCount = chunks.filter(
+    (c) => c.state === "received" || c.state === "playing" || c.state === "played",
+  ).length;
+  const playedCount = chunks.filter((c) => c.state === "played").length;
+  // 流式面板可见条件：流式模式下，正在跑或者有可视化历史
+  const showStreamPanel = mode === "stream" && (isGenerating || chunks.length > 0);
+
   return (
     <main className="app-shell">
       <section className="workspace">
@@ -393,6 +523,19 @@ function App() {
               onChange={(event) => setText(event.target.value)}
               placeholder="输入要合成的文本，建议尽量简短，过长文本在 CPU 上会很慢"
             />
+
+            {showStreamPanel && (
+              <StreamPanel
+                stage={stage}
+                chunks={chunks}
+                playingIndex={playingIndex}
+                ttfbMs={ttfbMs}
+                bufferedAhead={bufferedAhead}
+                receivedCount={receivedCount}
+                playedCount={playedCount}
+                totalChunks={totalChunks}
+              />
+            )}
           </section>
 
           <aside className="control-panel" aria-label="合成控制">
@@ -573,6 +716,125 @@ function App() {
         </div>
       </section>
     </main>
+  );
+}
+
+/* ============================================================
+ * 流式可视化子组件（克制版：静态布局，仅在数值变化时更新内容）
+ * ============================================================ */
+
+/** 阶段中文描述：用一行文字代替之前的步进器，没有任何动画。 */
+const STAGE_LABEL: Record<StreamStage, string> = {
+  idle: "待命",
+  connecting: "建立连接",
+  synthesizing: "合成中",
+  playing: "播放中",
+  finalizing: "整理音频",
+  done: "完成",
+  error: "出错",
+};
+
+/**
+ * 分片网格：每段一个等宽小方块，只通过颜色区分四种状态，不做任何 ripple/脉冲/pop。
+ * 给用户一个“整体进度地图”，而不是闪烁的舞台。
+ */
+function ChunkGrid({
+  chunks,
+  playingIndex,
+}: {
+  chunks: ChunkInfo[];
+  playingIndex: number | null;
+}) {
+  if (chunks.length === 0) {
+    return null;
+  }
+  return (
+    <div className="chunk-grid" role="list" aria-label="分片进度">
+      {chunks.map((chunk) => {
+        const isPlaying = chunk.index === playingIndex;
+        return (
+          <span
+            key={chunk.index}
+            role="listitem"
+            className={`cell cell-${chunk.state}${isPlaying ? " cell-current" : ""}`}
+            title={`分片 ${chunk.index + 1}${chunk.durationMs ? ` · ${(chunk.durationMs / 1000).toFixed(2)}s` : ""}`}
+            aria-label={`分片 ${chunk.index + 1} ${chunk.state}`}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * 流式综合面板：阶段文字 + 进度条 + 分片网格 + 静态数值。
+ * 设计目标：让信息可见，但不靠动画吸引注意力。
+ */
+function StreamPanel(props: {
+  stage: StreamStage;
+  chunks: ChunkInfo[];
+  playingIndex: number | null;
+  ttfbMs: number | null;
+  bufferedAhead: number;
+  receivedCount: number;
+  playedCount: number;
+  totalChunks: number;
+}) {
+  const {
+    stage,
+    chunks,
+    playingIndex,
+    ttfbMs,
+    bufferedAhead,
+    receivedCount,
+    playedCount,
+    totalChunks,
+  } = props;
+
+  // 整体接收进度（0~1）；未知 total 时退化为 0，避免进度条乱跳。
+  const ratio = totalChunks > 0 ? receivedCount / totalChunks : 0;
+
+  return (
+    <div className="stream-panel">
+      <div className="stream-row">
+        <span className="stream-stage">{STAGE_LABEL[stage]}</span>
+        <span className="stream-count">
+          {receivedCount}
+          <span className="muted">/{totalChunks || "?"}</span>
+          <span className="muted"> 已就绪</span>
+        </span>
+      </div>
+
+      <div
+        className="stream-bar"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={totalChunks || 1}
+        aria-valuenow={receivedCount}
+      >
+        <div className="stream-bar-fill" style={{ width: `${ratio * 100}%` }} />
+      </div>
+
+      <ChunkGrid chunks={chunks} playingIndex={playingIndex} />
+
+      <dl className="stream-meta">
+        <div>
+          <dt>已播放</dt>
+          <dd>
+            {playedCount}
+            <span className="muted">/{totalChunks || "?"}</span>
+          </dd>
+        </div>
+        <div>
+          <dt>首响</dt>
+          <dd>{ttfbMs === null ? "—" : `${(ttfbMs / 1000).toFixed(2)} s`}</dd>
+        </div>
+        <div>
+          <dt>缓冲</dt>
+          <dd>{bufferedAhead.toFixed(2)} s</dd>
+        </div>
+      </dl>
+    </div>
   );
 }
 
