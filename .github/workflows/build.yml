@@ -1,0 +1,56 @@
+name: docker
+
+# 触发条件：推送到默认分支、打 tag（v*），或手动触发。
+# 重写后镜像体积变大（含 PyTorch + 模型），不再对每个分支都构建。
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: xsdhy/chattts
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # 两种形态各构建一个镜像：CPU（默认 latest）与 GPU（CUDA 基础镜像）。
+      matrix:
+        include:
+          - variant: cpu
+            dockerfile: Dockerfile
+            tags: xsdhy/chattts:latest,xsdhy/chattts:cpu
+          - variant: gpu
+            dockerfile: Dockerfile.gpu
+            tags: xsdhy/chattts:gpu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push (${{ matrix.variant }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ matrix.tags }}
+          # 按形态分桶缓存，避免 CPU/GPU 互相覆盖缓存。
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}

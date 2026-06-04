@@ -1,0 +1,16 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+
+frontend/node_modules
+frontend/dist
+
+# 模型权重在构建期下载，不随上下文上传
+models/
+
+*.wav
+.DS_Store
+docs/
+*.ipynb

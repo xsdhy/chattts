@@ -1,0 +1,23 @@
+# ChatTTS 中文 TTS 服务后端依赖。
+#
+# 注意：torch 体积巨大且平台相关。CPU 形态由本文件安装 CPU 版 torch；
+# GPU 形态请改用 Dockerfile.gpu（基于 CUDA 基础镜像，自带 GPU 版 torch）。
+
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.7,<3.0
+numpy>=1.26,<2.0
+soundfile>=0.12,<1.0
+
+# 推理引擎：官方 ChatTTS 包（不再 vendoring 模型源码）。
+ChatTTS>=0.2,<1.0
+
+# torch 由 ChatTTS 间接依赖；显式列出以便锁定大版本。
+torch>=2.1,<3.0
+
+# transformers 由 ChatTTS 间接依赖，但 ChatTTS 0.2.x 仅在 4.4x 上验证过；
+# 锁定到 <5，避免 transformers 5.x 的破坏性变更导致推理失败。
+transformers>=4.41,<5.0
+
+# 模型下载（fetch_models.sh 调用）。
+huggingface_hub>=0.23

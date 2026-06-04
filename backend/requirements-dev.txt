@@ -1,0 +1,6 @@
+# 仅用于本地/CI 运行后端自动化测试，不打入运行镜像（保持镜像精简）。
+# 安装：.venv/bin/python -m pip install -r backend/requirements-dev.txt
+# 运行：.venv/bin/pytest
+pytest>=8.0
+pytest-asyncio>=0.23
+httpx>=0.27

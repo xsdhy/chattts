@@ -1,0 +1,66 @@
+# syntax=docker/dockerfile:1
+
+# ChatTTS 中文 TTS 服务 · GPU 形态多阶段构建。
+#
+# 与 CPU 版（Dockerfile）的区别只在运行时基础镜像：这里用官方 PyTorch CUDA 运行时
+# 镜像，自带 GPU 版 torch，因此无需再单独安装 torch。
+# 运行时需要宿主机具备 NVIDIA 驱动 + nvidia-container-toolkit，并加 `--gpus all`。
+#
+# 构建：
+#   docker build -f Dockerfile.gpu -t xsdhy/chattts:gpu .
+# 运行：
+#   docker run -p 8000:8000 --gpus all -v ./models:/app/models xsdhy/chattts:gpu
+
+# ---- 阶段 1：构建前端静态文件 ----
+FROM node:20-slim AS frontend
+
+WORKDIR /fe
+COPY frontend/package*.json ./
+RUN npm install
+COPY frontend/ ./
+RUN npm run build
+
+
+# ---- 阶段 2：下载模型权重 ----
+FROM python:3.11-slim AS assets
+
+WORKDIR /workspace
+RUN pip install --no-cache-dir "huggingface_hub>=0.23"
+COPY scripts/fetch_models.sh ./scripts/fetch_models.sh
+RUN MODEL_DIR=/workspace/models bash ./scripts/fetch_models.sh
+
+
+# ---- 阶段 3：运行时镜像（CUDA + PyTorch）----
+# 该镜像已内置 GPU 版 torch / torchaudio，Python 为 3.10/3.11（视镜像 tag 而定）。
+FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=8000 \
+    MODEL_DIR=/app/models \
+    MODELS_AUTO_DOWNLOAD=1 \
+    DEVICE=auto
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libsndfile1 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# torch 已由基础镜像提供；从 requirements 中剔除 torch 行后再安装，避免覆盖 GPU 版。
+COPY backend/requirements.txt ./requirements.txt
+RUN grep -ivE '^torch' requirements.txt > requirements.notorch.txt \
+    && pip install --no-cache-dir -r requirements.notorch.txt
+
+COPY backend/app ./app
+COPY scripts ./scripts
+COPY --from=assets /workspace/models ./models
+COPY --from=frontend /fe/dist ./static
+RUN chmod +x ./scripts/*.sh
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
+
+ENTRYPOINT ["./scripts/docker-entrypoint.sh"]

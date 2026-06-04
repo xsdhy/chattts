@@ -1,0 +1,41 @@
+services:
+  chattts:
+    image: xsdhy/chattts:latest
+    container_name: chattts
+    # 如需本地构建而非拉取镜像，注释掉上面的 image，改用 build：
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile        # CPU 形态；GPU 形态改为 Dockerfile.gpu
+    ports:
+      - "8000:8000"
+    environment:
+      # 所有变量均可选，不设置也能正常运行，这里仅作示例。
+      PORT: "8000"
+      DEVICE: "auto"            # auto / cuda / cpu
+      MAX_CONCURRENCY: "1"      # ChatTTS 显存占用大，默认 1
+      DEFAULT_SPEAKER: "2"      # 默认音色 seed
+      QUEUE_TIMEOUT: "60"
+      # 模型缺失（例如挂载了空目录）时是否自动下载，默认 1（开启）。
+      MODELS_AUTO_DOWNLOAD: "1"
+    volumes:
+      # 把模型目录挂载到宿主机，避免镜像重建后重复下载、并方便多容器共享。
+      # 首次启动若该目录为空，会自动下载模型到这里并持久化，之后直接复用。
+      # 想完全离线、用镜像内置模型时，把这一行注释掉即可。
+      - ./models:/app/models
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+    # ---- GPU 形态（取消注释并使用 Dockerfile.gpu 构建的镜像）----
+    # 需要宿主机安装 NVIDIA 驱动与 nvidia-container-toolkit。
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]

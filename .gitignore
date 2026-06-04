@@ -1,0 +1,41 @@
+# Python
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.coverage
+.cache
+.env
+
+# 模型权重（构建期下载，不入库）
+models/
+*.pt
+*.ckpt
+asset/*
+
+# 音频产物
+*.wav
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+
+# Jupyter
+.ipynb_checkpoints
+
+# 系统 / 编辑器
+.DS_Store
+.idea/
+.vscode/
+*.log
