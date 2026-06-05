@@ -510,3 +510,95 @@ audio {
   color: var(--ink-5);
   font-weight: 400;
 }
+
+/* ============================================================
+ * 「一键整理」预览（8.2）：只读、克制、无动画
+ * ============================================================ */
+.preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+/* 文字型次级操作（如「收起预览」），低视觉权重 */
+.link-button {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--accent-strong);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.preview-panel {
+  margin-top: 12px;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #e3e9e7;
+  border-radius: 8px;
+  background: #fbfcfb;
+}
+
+.preview-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--ink-3);
+}
+
+.preview-block {
+  display: grid;
+  gap: 6px;
+}
+
+/* 小标签：标识每个预览分区 */
+.preview-tag {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink-5);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.preview-text {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #fff;
+  border: 1px solid #eef2f0;
+  color: var(--ink-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.6;
+}
+
+.preview-segments {
+  margin: 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 4px;
+  color: var(--ink-2);
+}
+
+.preview-changes {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+  color: var(--ink-3);
+}
+
+.preview-changes code {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  padding: 0 4px;
+  border-radius: 4px;
+}
+
+.preview-changes .muted,
+.preview-row .muted {
+  color: var(--ink-5);
+}

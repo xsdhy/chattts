@@ -9,6 +9,7 @@ import {
   Mic,
   Play,
   Sparkles,
+  Wand2,
   X,
 } from "lucide-react";
 import "./styles.css";
@@ -25,6 +26,18 @@ type Speaker = {
 
 /** 生成模式：普通（一次性返回 WAV）/ 流式（SSE 边收边播）。 */
 type Mode = "normal" | "stream";
+
+/** `/api/tts/preprocess` 预览响应，对应后端 PreprocessResponse。 */
+type PreprocessPreview = {
+  original_text: string;
+  normalized_text: string;
+  refine_prompt: string | null;
+  prosody: string;
+  profile: string;
+  refine_mode: "token_injection" | "refine_prompt";
+  segments: { index: number; text: string }[];
+  changes: { type: string; from: string; to: string }[];
+};
 
 /** 健康检查响应，对应后端 HealthResponse。 */
 type Health = {
@@ -104,6 +117,19 @@ function App() {
   const [temperature, setTemperature] = React.useState(0.3);
   const [topP, setTopP] = React.useState(0.7);
   const [topK, setTopK] = React.useState(20);
+
+  // ---- 文本预处理参数（对应后端 6.1，普通/流式都生效）----
+  const [preprocess, setPreprocess] = React.useState(true);
+  const [preprocessProfile, setPreprocessProfile] =
+    React.useState<"plain" | "balanced" | "expressive">("balanced");
+  const [prosody, setProsody] = React.useState<
+    "flat" | "natural" | "dialogue" | "narration"
+  >("natural");
+  const [allowControlTokens, setAllowControlTokens] = React.useState(false);
+
+  // ---- 「一键整理」预览状态（落实 D5：仅展示，不改写输入框）----
+  const [isPreviewing, setIsPreviewing] = React.useState(false);
+  const [preview, setPreview] = React.useState<PreprocessPreview | null>(null);
 
   // ---- 交互状态 ----
   const [isSampling, setIsSampling] = React.useState(false);
@@ -238,11 +264,47 @@ function App() {
       top_p: topP,
       top_k: topK,
       format: "wav",
+      // 文本预处理参数：普通与流式都带上（后端两接口都生效，见 6.1）。
+      preprocess,
+      preprocess_profile: preprocessProfile,
+      prosody,
+      allow_control_tokens: allowControlTokens,
     };
     if (includeChunkSize) {
+      // 流式后续分片目标上限（沿用现有 streamChunkChars）；首片走服务端默认。
       base.max_segment_chars = streamChunkChars;
     }
     return base;
+  }
+
+  /**
+   * 「一键整理」：调用 `POST /api/tts/preprocess` 预览处理结果（落实 D5）。
+   * 仅用于展示，**不改写输入框**；提交 TTS 时仍发送原文，由服务端再次完整预处理。
+   * 与 TTS 请求互不阻塞；生成进行中禁用，避免状态错乱。
+   */
+  async function previewPreprocess() {
+    if (charCount === 0 || isGenerating || isPreviewing) {
+      return;
+    }
+    setIsPreviewing(true);
+    setError("");
+    try {
+      const response = await fetch("/api/tts/preprocess", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // 预览也带上流式分片字段，分片预览与流式实际切分一致。
+        body: JSON.stringify(requestBody(true)),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(formatApiError(payload, response.status));
+      }
+      setPreview((await response.json()) as PreprocessPreview);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "预览失败");
+    } finally {
+      setIsPreviewing(false);
+    }
   }
 
   /** 设置新的音频 URL，并 revoke 旧的，避免内存泄漏。 */
@@ -555,6 +617,34 @@ function App() {
               placeholder="输入要合成的文本，建议尽量简短，过长文本在 CPU 上会很慢"
             />
 
+            <div className="preview-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={charCount === 0 || controlsDisabled || isPreviewing}
+                onClick={previewPreprocess}
+                title="预览文本将被如何朗读（不会改写输入框）"
+              >
+                {isPreviewing ? (
+                  <Loader2 className="spin" size={16} aria-hidden="true" />
+                ) : (
+                  <Wand2 size={16} aria-hidden="true" />
+                )}
+                <span>一键整理 / 预览</span>
+              </button>
+              {preview && (
+                <button
+                  className="link-button"
+                  type="button"
+                  onClick={() => setPreview(null)}
+                >
+                  收起预览
+                </button>
+              )}
+            </div>
+
+            {preview && <PreprocessPreviewPanel preview={preview} />}
+
             {showStreamPanel && (
               <StreamPanel
                 stage={stage}
@@ -672,7 +762,64 @@ function App() {
               {showAdvanced && (
                 <div className="advanced-body">
                   <label className="switch-row">
-                    <span>文本 refine</span>
+                    <span title="对数字/日期/单位/Markdown 等做轻量可读化处理">
+                      文本增强
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={preprocess}
+                      disabled={controlsDisabled}
+                      onChange={(event) => setPreprocess(event.target.checked)}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>增强强度</span>
+                    <select
+                      value={preprocessProfile}
+                      disabled={controlsDisabled || !preprocess}
+                      onChange={(event) =>
+                        setPreprocessProfile(
+                          event.target.value as typeof preprocessProfile,
+                        )
+                      }
+                    >
+                      <option value="plain">简洁</option>
+                      <option value="balanced">均衡（默认）</option>
+                      <option value="expressive">表现力</option>
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>朗读风格</span>
+                    <select
+                      value={prosody}
+                      disabled={controlsDisabled || !preprocess}
+                      onChange={(event) =>
+                        setProsody(event.target.value as typeof prosody)
+                      }
+                    >
+                      <option value="flat">平实</option>
+                      <option value="natural">自然</option>
+                      <option value="dialogue">对话</option>
+                      <option value="narration">旁白</option>
+                    </select>
+                  </label>
+                  <label className="switch-row">
+                    <span title="仅适合高级用户：允许文本中的 ChatTTS 控制 token（如 [uv_break]）生效">
+                      允许控制 token
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={allowControlTokens}
+                      disabled={controlsDisabled || !preprocess}
+                      onChange={(event) =>
+                        setAllowControlTokens(event.target.checked)
+                      }
+                    />
+                  </label>
+                  <label className="switch-row">
+                    <span title="开启后由 ChatTTS refine 接管停顿（与上面的「朗读风格」二者互斥）">
+                      文本 refine
+                    </span>
                     <input
                       type="checkbox"
                       checked={refine}
@@ -885,6 +1032,57 @@ function StreamPanel(props: {
           <dd>{bufferedAhead.toFixed(2)} s</dd>
         </div>
       </dl>
+    </div>
+  );
+}
+
+/**
+ * 「一键整理」只读预览面板（落实 8.2）：展示归一化文本、分片列表、变更记录、以及
+ * D1 路径（refine_mode / refine_prompt）。不改写输入框，仅供用户预览所见即所得。
+ */
+function PreprocessPreviewPanel({ preview }: { preview: PreprocessPreview }) {
+  const modeLabel =
+    preview.refine_mode === "refine_prompt"
+      ? `refine 接管停顿（${preview.refine_prompt ?? ""}）`
+      : "标点停顿（不注入 token）";
+  return (
+    <div className="preview-panel" aria-label="预处理预览">
+      <div className="preview-row">
+        <span className="preview-tag">朗读策略</span>
+        <span>
+          {preview.profile} · {preview.prosody} · {modeLabel}
+        </span>
+      </div>
+
+      <div className="preview-block">
+        <span className="preview-tag">归一化文本</span>
+        <p className="preview-text">{preview.normalized_text || "（空）"}</p>
+      </div>
+
+      <div className="preview-block">
+        <span className="preview-tag">分片（{preview.segments.length}）</span>
+        <ol className="preview-segments">
+          {preview.segments.map((seg) => (
+            <li key={seg.index}>{seg.text}</li>
+          ))}
+        </ol>
+      </div>
+
+      {preview.changes.length > 0 && (
+        <div className="preview-block">
+          <span className="preview-tag">变更（{preview.changes.length}）</span>
+          <ul className="preview-changes">
+            {preview.changes.map((change, i) => (
+              <li key={i}>
+                <code>{change.from}</code>
+                <span className="muted"> → </span>
+                <code>{change.to}</code>
+                <span className="muted"> · {change.type}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }

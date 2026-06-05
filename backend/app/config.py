@@ -60,6 +60,25 @@ def _float_env(name: str, default: float) -> float:
     return value
 
 
+def _resolve_stream_segment_chars(default: int = 100) -> int:
+    """解析流式「后续分片目标上限」``STREAM_SEGMENT_CHARS``（见 7.6）。
+
+    向后兼容：若未设置新变量、但设置了旧的 ``STREAM_MAX_SEGMENT_CHARS``，则把旧值作为
+    ``STREAM_SEGMENT_CHARS`` 读取并告警（旧变量语义已由「硬切上限」改为「后续分片目标
+    上限参考」，见 6.1）。
+    """
+
+    if os.getenv("STREAM_SEGMENT_CHARS") is not None:
+        return _int_env("STREAM_SEGMENT_CHARS", default)
+    if os.getenv("STREAM_MAX_SEGMENT_CHARS") is not None:
+        logger.warning(
+            "STREAM_MAX_SEGMENT_CHARS 已弃用：将作为 STREAM_SEGMENT_CHARS（后续分片目标"
+            "上限）读取。请改用 STREAM_SEGMENT_CHARS / STREAM_FIRST_SEGMENT_CHARS。"
+        )
+        return _int_env("STREAM_MAX_SEGMENT_CHARS", default)
+    return default
+
+
 def _default_model_dir() -> Path:
     """推导默认模型目录（探测链：MODEL_DIR → repo/models → /app/models）。
 
@@ -126,11 +145,15 @@ class Settings:
 
     # ---- 文本切分 / 长度限制 ----
     max_text_len: int = _int_env("MAX_TEXT_LEN", 2000)
+    # 普通接口 POST /api/tts 的分片目标上限（不启用双阈值，见 6.8）。
     max_segment_chars: int = _int_env("MAX_SEGMENT_CHARS", 120)
-    # 流式接口专用、更小的分段上限：分片更多 → 首片更快到达、全程更流畅（代价是推理
-    # 次数增多、总合成时间略升、衔接处可能略碎）。它同时是短段合并的目标长度，因此调小
-    # 也会减弱短段合并力度。普通接口 POST /api/tts 仍用 MAX_SEGMENT_CHARS。
-    stream_max_segment_chars: int = _int_env("STREAM_MAX_SEGMENT_CHARS", 50)
+    # ---- 流式双阈值（见 6.8 / 7.6）----
+    # 首片目标上限：小，求快，让用户尽快出声。
+    stream_first_segment_chars: int = _int_env("STREAM_FIRST_SEGMENT_CHARS", 50)
+    # 后续分片目标上限：大，求连贯，减少推理次数与段间割裂。
+    stream_segment_chars: int = _resolve_stream_segment_chars(100)
+    # 首片无法在自然断点结束时的硬上限。
+    stream_first_hard_cap: int = _int_env("STREAM_FIRST_HARD_CAP", 90)
     silence_ms_between_segments: int = _int_env("SILENCE_MS_BETWEEN_SEGMENTS", 120)
 
     # ---- 并发 / 输出 ----

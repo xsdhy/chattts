@@ -15,18 +15,22 @@ from __future__ import annotations
 
 import io
 import logging
-import re
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import soundfile as sf
 
 from .config import Settings, settings
 from .speakers import parse_speaker, speaker_registry
+from .text_preprocess import (
+    AtomicSpan,
+    PreprocessOptions,
+    PreprocessResult,
+    preprocess_text,
+)
 
 logger = logging.getLogger("chattts.engine")
 
@@ -53,6 +57,21 @@ class SynthesisResult:
 
 
 @dataclass(frozen=True)
+class SegmentPlan:
+    """``plan_segments`` 的结果：把「可在推理前完成」的产物打包在一起。
+
+    既供普通 / 流式合成路径消费（``seed``/``speed``/``segments``/``refine_prompt``），
+    也供预览接口回显（``result`` 携带 ``normalized_text``/``changes``/``refine_mode``）。
+    """
+
+    seed: int
+    speed: float
+    segments: list[str]
+    refine_prompt: str | None
+    result: PreprocessResult
+
+
+@dataclass(frozen=True)
 class SegmentSynthesis:
     """单个分段的逐段合成结果，供流式接口逐段产出。
 
@@ -75,11 +94,6 @@ class ChatTTSEngine:
     懒加载 + 锁保证一个进程内只构造一次。FastAPI 在 ``lifespan`` 里显式调用
     ``load()`` 预热；首请求也可触发加载。
     """
-
-    # 句末标点（硬断点）与软断点（逗号 / 顿号 / 空白）。
-    # 注：归一化已把 \n 压成空格，因此 sentence_break 中不再包含 \n。
-    _sentence_break_re = re.compile(r"([。！？!?；;：:]+)")
-    _soft_break_re = re.compile(r"([，,、\s]+)")
 
     def __init__(self, config: Settings = settings) -> None:
         self.config = config
@@ -200,6 +214,7 @@ class ChatTTSEngine:
         temperature: float = 0.3,
         top_p: float = 0.7,
         top_k: int = 20,
+        options: PreprocessOptions | None = None,
     ) -> SynthesisResult:
         """把文本合成为完整音频样本。
 
@@ -209,6 +224,7 @@ class ChatTTSEngine:
             speed: 语速，缺省用配置默认值。
             refine: 是否启用 ChatTTS 文本 refine。
             temperature/top_p/top_k: 采样参数。
+            options: 文本预处理选项；缺省按 ``refine`` 构造默认 ``balanced/natural``。
 
         Returns:
             ``SynthesisResult``（float32 单声道样本 + 采样率）。
@@ -216,6 +232,7 @@ class ChatTTSEngine:
         实现上复用与流式接口相同的 ``plan_segments`` + ``synthesize_segment``，因此
         普通接口与流式接口的逐段合成、变速、段间静音语义完全一致——这正是“流式下载
         得到的完整 WAV 与普通接口输出在听感上一致”的前提（见需求 9.3/9.9）。
+        普通接口不启用双阈值（首片/后续片用同一较大目标长度，见 6.8）。
 
         Raises:
             ValueError: 文本为空、参数非法或音色非法。
@@ -223,26 +240,30 @@ class ChatTTSEngine:
             ModelAssetError: 模型不可用。
         """
 
-        seed, selected_speed, segments = self.plan_segments(
-            text, speaker=speaker, speed=speed
+        plan = self.plan_segments(
+            text,
+            speaker=speaker,
+            speed=speed,
+            options=options if options is not None else PreprocessOptions(refine=refine),
         )
         self.load()
 
-        total = len(segments)
+        total = len(plan.segments)
         sample_rate = self.config.sample_rate
         pieces: list[np.ndarray] = []
         started = time.monotonic()
-        for index, segment in enumerate(segments):
+        for index, segment in enumerate(plan.segments):
             result = self.synthesize_segment(
                 segment,
                 index,
                 total,
-                seed=seed,
-                speed=selected_speed,
+                seed=plan.seed,
+                speed=plan.speed,
                 refine=refine,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
+                refine_prompt=plan.refine_prompt,
             )
             sample_rate = result.sample_rate
             # ``synthesize_segment`` 已把“非末尾分段的段间静音”并入分段尾部，
@@ -255,12 +276,13 @@ class ChatTTSEngine:
         merged = np.concatenate(pieces)
         elapsed = time.monotonic() - started
         logger.info(
-            "合成完成：chars=%d segments=%d speaker=%d speed=%s refine=%s 耗时=%.2fs",
+            "合成完成：chars=%d segments=%d speaker=%d speed=%s refine=%s refine_mode=%s 耗时=%.2fs",
             len(text or ""),
             total,
-            seed,
-            selected_speed,
+            plan.seed,
+            plan.speed,
             refine,
+            plan.result.refine_mode,
             elapsed,
         )
         return SynthesisResult(samples=merged, sample_rate=sample_rate)
@@ -271,30 +293,35 @@ class ChatTTSEngine:
         *,
         speaker: str | None = None,
         speed: float | None = None,
-        max_chars: int | None = None,
-    ) -> tuple[int, float, list[str]]:
-        """流式前置：做参数校验与文本切分，但**不触发模型推理**。
+        options: PreprocessOptions | None = None,
+        first_chars: int | None = None,
+        rest_chars: int | None = None,
+    ) -> SegmentPlan:
+        """流式前置：做参数校验、文本预处理与分片，但**不触发模型推理**。
 
         把“可在流开始前完成的校验”集中在这里，供流式路由在返回 200 之前调用，从而把
         文本为空、语速越界、音色非法等问题用标准 HTTP 400 反馈，而不是变成 SSE
         ``error`` 事件（见需求 5）。
 
+        管线（落实 5.2 / 7.5）：``preprocess_text(text, options)`` → ``segment_text(...)``。
+        预处理与原子保护在普通 / 流式接口完全一致，仅长度阈值不同（D3）。
+
         Args:
-            max_chars: 分段上限（同时是短段合并的目标长度）。缺省用
-                ``MAX_SEGMENT_CHARS``（普通接口）；流式路由传入更小的
-                ``STREAM_MAX_SEGMENT_CHARS`` 以获得更多、更小的分片，让首片更快到达、
-                全程更流畅。
+            options: 预处理选项；缺省 ``PreprocessOptions()``（balanced/natural/不 refine）。
+            first_chars: 首片目标上限。缺省回退到 ``rest_chars``（普通接口即不启用双阈值）。
+            rest_chars: 后续分片目标上限。缺省用 ``MAX_SEGMENT_CHARS``（普通接口）。
+                流式路由分别传入 ``STREAM_FIRST_SEGMENT_CHARS`` / ``STREAM_SEGMENT_CHARS``。
 
         Returns:
-            ``(seed, selected_speed, segments)``：解析后的音色 seed、语速与切分后的
-            文本分段列表。
+            ``SegmentPlan``：音色 seed、语速、分段列表、refine_prompt 与完整预处理结果。
 
         Raises:
             ValueError: 文本为空、语速越界或音色标识非法。
         """
 
-        normalized = self._normalize_text(text)
-        if not normalized:
+        options = options if options is not None else PreprocessOptions()
+        result = preprocess_text(text, options)
+        if not result.text.strip():
             raise ValueError("文本不能为空")
 
         # parse_speaker 对非整数 / 越界 seed 抛 ValueError，由路由层映射为 400。
@@ -302,13 +329,53 @@ class ChatTTSEngine:
         selected_speed = self._validate_speed(
             speed if speed is not None else self.config.default_speed
         )
-        segments = split_text(
-            normalized, max_chars=max_chars or self.config.max_segment_chars
+
+        rest = rest_chars or self.config.max_segment_chars
+        first = first_chars or rest
+        # 首片长度微调（仅双阈值流式生效，见 6.8 第 5 条）：
+        # - expressive profile：首片略短、出声更快、保留更多停顿；
+        # - flat prosody：首片略长、减少段间割裂。
+        if first < rest:
+            if options.profile == "expressive":
+                first = max(10, int(first * 0.8))
+            elif options.prosody == "flat":
+                first = min(rest, int(first * 1.2))
+        # 仅当首片目标显著小于后续片（即流式双阈值）时才启用「首片硬上限」；
+        # 普通接口 first==rest，硬上限等于 rest，相当于不特殊处理首片。
+        first_cap = self.config.stream_first_hard_cap if first < rest else rest
+
+        segments = segment_text(
+            result.text,
+            result.atomic_spans,
+            first_chars=first,
+            rest_chars=rest,
+            first_hard_cap=first_cap,
         )
         if not segments:
             raise ValueError("文本不能为空")
 
-        return seed, selected_speed, segments
+        # 可观测性（6.10）：只记录长度、分段数、命中的规则类型计数、refine_mode，
+        # **不记录完整文本**，兼顾隐私与按真实样本迭代规则的需要。
+        if logger.isEnabledFor(logging.INFO):
+            hit_counts: dict[str, int] = {}
+            for change in result.changes:
+                hit_counts[change.type] = hit_counts.get(change.type, 0) + 1
+            logger.info(
+                "preprocess: chars_in=%d chars_out=%d segments=%d refine_mode=%s rules=%s",
+                len(text or ""),
+                len(result.text),
+                len(segments),
+                result.refine_mode,
+                hit_counts,
+            )
+
+        return SegmentPlan(
+            seed=seed,
+            speed=selected_speed,
+            segments=segments,
+            refine_prompt=result.refine_prompt,
+            result=result,
+        )
 
     def synthesize_segment(
         self,
@@ -322,11 +389,17 @@ class ChatTTSEngine:
         temperature: float = 0.3,
         top_p: float = 0.7,
         top_k: int = 20,
+        refine_prompt: str | None = None,
     ) -> SegmentSynthesis:
         """合成单个分段，并按“段间静音一致性”要求处理尾部静音。
 
         这是流式接口的最小同步单元：路由层会用 ``asyncio.to_thread`` 调用本方法，避免
         阻塞事件循环。``seed``/``speed`` 应来自 ``plan_segments`` 的解析结果。
+
+        ``refine_prompt``（落实 D1）：仅当 ``refine=True`` 时用它构造 ``RefineTextParams``
+        交给 ChatTTS 由 refine_text 全权负责停顿；缺省回退到历史默认
+        ``[oral_2][laugh_0][break_4]``。``refine=False`` 路径下不注入任何手工停顿 token，
+        停顿完全交由文本自身标点与 ChatTTS 决定，此处不走 refine。
 
         段间静音策略（见需求 4.3）：
         - **非末尾**分段（``is_final=False``）在其音频尾部并入一段段间静音；
@@ -345,7 +418,9 @@ class ChatTTSEngine:
             top_p=top_p,
             top_k=top_k,
         )
-        refine_params = self._build_refine_params() if refine else None
+        refine_params = (
+            self._build_refine_params(refine_prompt) if refine else None
+        )
 
         piece = self._infer_segment(
             segment,
@@ -379,6 +454,7 @@ class ChatTTSEngine:
         temperature: float = 0.3,
         top_p: float = 0.7,
         top_k: int = 20,
+        options: PreprocessOptions | None = None,
     ) -> bytes:
         """合成并编码为 WAV 字节，供 API 直接返回。"""
 
@@ -390,6 +466,7 @@ class ChatTTSEngine:
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            options=options,
         )
         return encode_wav(result.samples, result.sample_rate)
 
@@ -439,22 +516,22 @@ class ChatTTSEngine:
             top_K=top_k,
         )
 
-    def _build_refine_params(self):
-        """构造默认的 ``RefineTextParams``（口语化 + 适度停顿）。"""
+    def _build_refine_params(self, prompt: str | None = None):
+        """构造 ``RefineTextParams``。
+
+        ``prompt`` 来自 ``prosody`` 配置化映射（见 6.7）；缺省保留历史默认
+        ``[oral_2][laugh_0][break_4]``，保证未传 prosody 时行为不变。
+        """
 
         import ChatTTS
 
-        return ChatTTS.Chat.RefineTextParams(prompt="[oral_2][laugh_0][break_4]")
+        return ChatTTS.Chat.RefineTextParams(
+            prompt=prompt or "[oral_2][laugh_0][break_4]"
+        )
 
     # ------------------------------------------------------------------ #
     # 内部：文本与校验
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _normalize_text(text: str) -> str:
-        """最小文本归一化：合并连续空白，去首尾空白，保留标点语义。"""
-
-        return re.sub(r"\s+", " ", text or "").strip()
-
     @staticmethod
     def _validate_speed(speed: float) -> float:
         """校验语速范围 0.5~2.0。
@@ -496,35 +573,162 @@ def _model_dir_ready(model_dir: Path) -> bool:
     return True
 
 
-def split_text(text: str, *, max_chars: int = 120) -> list[str]:
-    """按中文标点和长度阈值切分文本。
+# 句末硬断点（强边界）与软断点（弱边界）字符集。同时认全角与半角，因为预处理不强制
+# 把英文标点转中文。注意：**不再**在分片入口二次压缩空白（D2/6.8）——结构标记此时已
+# token 化，二次 ``re.sub(r"\s+"," ")`` 会破坏它们。
+_HARD_BREAK_CHARS = frozenset("。！？!?；;：:")
+_SOFT_BREAK_CHARS = frozenset("，,、 \t")
 
-    策略分三层：
-    1. 优先按句末标点切句（保留标点，朗读停顿更自然）；
-    2. 单句过长时再按逗号 / 顿号 / 空白等软断点切；
-    3. 仍过长则按固定长度硬切，确保单段不超过阈值。
-    最后合并过短片段，减少推理次数。
+
+def segment_text(
+    text: str,
+    atomic_spans: list[AtomicSpan] | None = None,
+    *,
+    first_chars: int,
+    rest_chars: int,
+    first_hard_cap: int | None = None,
+) -> list[str]:
+    """token / 原子-aware 的分片器（落实 D3 / 6.8）。
+
+    输入为**预处理后的可朗读文本**及其原子片段标注。核心约束：任何层级（含受约束硬切）
+    都不得切开一个 ``AtomicSpan``（ChatTTS token、日期、时间、金额、百分比、单位、英文
+    缩写、URL 占位符、长编号等）。
+
+    切分优先级（6.8）：句末硬断点 → 软断点（逗号 / 顿号 / 空格）→ 受约束硬切（在不破坏
+    原子片段前提下尽量靠近目标上限）。``[lbreak]`` 结构标记作为强制分片边界，让段落 /
+    列表项优先成片。
+
+    双阈值（6.8）：首片用 ``first_chars``（求快），后续片用 ``rest_chars``（求连贯）；首片
+    若无法在自然断点内结束，可延长到 ``first_hard_cap``。普通接口令 ``first==rest`` 即退化为
+    单阈值。
+
+    Args:
+        text: 预处理后的可朗读文本。
+        atomic_spans: 原子片段区间列表。
+        first_chars: 首片目标上限。
+        rest_chars: 后续分片目标上限。
+        first_hard_cap: 首片硬上限；缺省取 ``rest_chars``。
+
+    Returns:
+        分段后的文本列表（每段已 strip，丢弃空段）。
     """
 
-    normalized = re.sub(r"\s+", " ", text or "").strip()
-    if not normalized:
+    if not text or not text.strip():
+        return []
+    spans = atomic_spans or []
+    first_hard_cap = first_hard_cap or rest_chars
+    length = len(text)
+
+    # 位于原子片段「内部」的切点（严格在 (start, end) 之间）一律禁止切分。
+    forbidden: set[int] = set()
+    for span in spans:
+        forbidden.update(range(span.start + 1, span.end))
+    # [lbreak] 结构标记的结束位置：作为强制分片边界。
+    lbreak_ends = {
+        span.end for span in spans if text[span.start:span.end] == "[lbreak]"
+    }
+
+    # 1) 先在所有「自然断点」处切出最细原子片段（hard / soft / lbreak 边界）。
+    #    禁止切点（原子片段内部）即便恰为断点字符也跳过——这正是「不切开缩写里的空格」。
+    cut_points = [0]
+    for i, ch in enumerate(text):
+        cut = i + 1
+        if cut in forbidden:
+            continue
+        if ch in _HARD_BREAK_CHARS or ch in _SOFT_BREAK_CHARS or cut in lbreak_ends:
+            cut_points.append(cut)
+    if cut_points[-1] != length:
+        cut_points.append(length)
+
+    # 原子片段三元组：(start, end, 是否 lbreak 强制边界)；空白原子并入前段、此处先跳过。
+    atoms: list[list] = []
+    for start, end in zip(cut_points, cut_points[1:]):
+        if not text[start:end].strip():
+            continue
+        atoms.append([start, end, end in lbreak_ends])
+
+    # 2) 仍超过 rest_chars 的原子（无自然断点的长串）→ 受约束硬切（不破坏原子片段）。
+    ranges: list[list] = []
+    for start, end, is_lbreak in atoms:
+        wrapped = _constrained_wrap(start, end, rest_chars, forbidden)
+        for sub_index, (sub_start, sub_end) in enumerate(wrapped):
+            # 仅把 lbreak 边界标记保留在该原子的最后一个子片段上。
+            ranges.append([sub_start, sub_end, is_lbreak and sub_index == len(wrapped) - 1])
+
+    if not ranges:
         return []
 
-    sentence_chunks = _split_keep_delimiter(
-        normalized, ChatTTSEngine._sentence_break_re
-    )
-    segments: list[str] = []
-    for chunk in sentence_chunks:
-        if len(chunk) <= max_chars:
-            segments.append(chunk)
-            continue
-        for soft_chunk in _split_keep_delimiter(chunk, ChatTTSEngine._soft_break_re):
-            if len(soft_chunk) <= max_chars:
-                segments.append(soft_chunk)
-            else:
-                segments.extend(_hard_wrap(soft_chunk, max_chars=max_chars))
+    # 双阈值下：若首个 range 自身就超过首片硬上限，对它单独按硬上限再细切。
+    if first_chars < rest_chars and (ranges[0][1] - ranges[0][0]) > first_hard_cap:
+        head = ranges.pop(0)
+        rewrapped = _constrained_wrap(head[0], head[1], first_hard_cap, forbidden)
+        injected = [[s, e, False] for s, e in rewrapped]
+        if injected:
+            injected[-1][2] = head[2]
+        ranges = injected + ranges
 
-    return _merge_short_segments(segments, max_chars=max_chars)
+    # 3) 贪婪打包：首片目标 first_chars、后续片目标 rest_chars；[lbreak] 强制成段边界。
+    segments: list[str] = []
+    cur_start: int | None = None
+    cur_end = 0
+
+    def _flush() -> None:
+        nonlocal cur_start, cur_end
+        if cur_start is not None:
+            piece = text[cur_start:cur_end].strip()
+            if piece:
+                segments.append(piece)
+        cur_start = None
+
+    for start, end, is_lbreak in ranges:
+        target = first_chars if not segments else rest_chars
+        if cur_start is None:
+            cur_start, cur_end = start, end
+        elif (end - cur_start) <= target:
+            cur_end = end
+        else:
+            _flush()
+            cur_start, cur_end = start, end
+        if is_lbreak:
+            _flush()
+    _flush()
+    return segments
+
+
+def _constrained_wrap(
+    start: int, end: int, limit: int, forbidden: set[int]
+) -> list[tuple[int, int]]:
+    """受约束硬切：把 ``[start, end)`` 切成若干 ≤ ``limit`` 的子区间，且不切开原子片段。
+
+    优先在 ``start + limit`` 处切；该处若落在原子片段内部（禁止切点），先向左回退寻找
+    合法切点，再不行则向右延伸到第一个合法切点（此时子片段会略超 ``limit``，这是为
+    保护语义单元而允许的——见 6.1「允许为保护语义单元略微超出」）。
+    """
+
+    if end - start <= limit:
+        return [(start, end)]
+    pieces: list[tuple[int, int]] = []
+    pos = start
+    while end - pos > limit:
+        cut = pos + limit
+        # 向左回退到合法切点。
+        back = cut
+        while back > pos and back in forbidden:
+            back -= 1
+        if back > pos:
+            cut = back
+        else:
+            # 左侧全被原子片段占据：向右延伸到第一个合法切点。
+            cut = pos + limit
+            while cut < end and cut in forbidden:
+                cut += 1
+            if cut >= end:
+                break
+        pieces.append((pos, cut))
+        pos = cut
+    if pos < end:
+        pieces.append((pos, end))
+    return pieces
 
 
 def encode_wav(samples: np.ndarray, sample_rate: int) -> bytes:
@@ -551,52 +755,6 @@ def write_wav(path: str | Path, samples: np.ndarray, sample_rate: int) -> None:
         format="WAV",
         subtype="PCM_16",
     )
-
-
-def _split_keep_delimiter(text: str, pattern: re.Pattern[str]) -> list[str]:
-    """按正则切分并把分隔符拼回前一片段，避免丢失停顿信息。"""
-
-    parts = pattern.split(text)
-    chunks: list[str] = []
-    current = ""
-    for part in parts:
-        if not part:
-            continue
-        current += part
-        if pattern.fullmatch(part):
-            chunks.append(current.strip())
-            current = ""
-    if current.strip():
-        chunks.append(current.strip())
-    return chunks
-
-
-def _hard_wrap(text: str, *, max_chars: int) -> list[str]:
-    """没有合适标点时按固定长度切分。"""
-
-    return [
-        text[index : index + max_chars].strip()
-        for index in range(0, len(text), max_chars)
-        if text[index : index + max_chars].strip()
-    ]
-
-
-def _merge_short_segments(segments: Iterable[str], *, max_chars: int) -> list[str]:
-    """合并过短片段，减少推理次数，同时保持长度上限。"""
-
-    merged: list[str] = []
-    current = ""
-    for segment in (item.strip() for item in segments if item.strip()):
-        candidate = f"{current}{segment}" if current else segment
-        if len(candidate) <= max_chars:
-            current = candidate
-        else:
-            if current:
-                merged.append(current)
-            current = segment
-    if current:
-        merged.append(current)
-    return merged
 
 
 def _to_mono_float32(samples: np.ndarray) -> np.ndarray:

@@ -11,6 +11,8 @@
 - **随机音色采样**（ChatTTS 特色）：以 `seed` 为音色 id，相同 seed 复现相同音色。
 - 可调采样参数：`temperature` / `top_p` / `top_k`，以及文本 `refine` 开关。
 - 语速调节（0.5x–2.0x，numpy 线性插值变速，无需 ffmpeg）。
+- **文本预处理管线**：进入 ChatTTS 前做轻量、可解释、可回退的归一化——安全清洗、Markdown/段落结构化、数字/日期/金额/百分比/单位读法、英文缩写、控制 token 白名单保护。可通过 `preprocess` / `preprocess_profile` / `prosody` / `allow_control_tokens` 调节，并支持 `POST /api/tts/preprocess` **一键预览**朗读结果。
+- **token/原子-aware 分片 + 流式双阈值**：分片基于预处理结果，任何层级（含硬切）都不切开 token、日期、金额、单位、缩写、URL 占位符；流式首片小求快、后续片大求连贯。
 - 长文本分段：按中文标点 / 软断点 / 字数阈值切分后拼接，段间插入静音。
 - GPU/CPU 自适应：`DEVICE=auto` 自动探测 CUDA，无 GPU 回退 CPU。
 - 并发保护：信号量限制同时推理数，排队超时返回 503（默认并发 1，保护显存）。
@@ -35,7 +37,8 @@
 │       ├── main.py            # FastAPI 入口：路由 + 静态托管 + lifespan
 │       ├── config.py          # Settings + 环境变量解析 + 设备探测
 │       ├── schemas.py         # Pydantic 请求/响应模型
-│       ├── tts_engine.py      # 核心引擎：ChatTTS 封装、切分、变速、逐段产出、WAV 编码
+│       ├── text_preprocess.py # 纯函数文本预处理管线（清洗/结构化/读法规范化/原子片段）
+│       ├── tts_engine.py      # 核心引擎：ChatTTS 封装、预处理集成、token-aware 分片、变速、逐段产出、WAV 编码
 │       ├── speakers.py        # 音色：随机采样、seed 缓存、命名清单
 │       └── concurrency.py     # 推理信号量限流（acquire/release/slot，排队超时 503）
 ├── frontend/                  # React + TypeScript + Vite 单页应用
@@ -84,8 +87,9 @@
 |---|---|
 | `main.py` | 创建 FastAPI app；`lifespan` 启动时异步加载模型；注册路由；挂载静态前端；SPA fallback；校验错误转 400 |
 | `config.py` | 冻结的 `Settings` dataclass；从环境变量解析；模型目录探测链；`DEVICE=auto` 设备探测 |
-| `schemas.py` | `TTSRequest`、`SpeakerResponse`、`HealthResponse` 等 Pydantic 模型 |
-| `tts_engine.py` | `ChatTTSEngine`：懒加载（线程安全双检锁）、文本归一化/切分、分段合成 + 段间静音、变速、WAV 编码；自定义异常层级 |
+| `schemas.py` | `TTSRequest`、`SpeakerResponse`、`HealthResponse`、`PreprocessResponse` 等 Pydantic 模型 |
+| `text_preprocess.py` | 纯函数预处理管线：安全清洗、Markdown/段落结构化、控制 token 白名单、数字/日期/金额/单位读法、英文缩写、原子片段收集、单规则失败跳过 + 整体异常回退 |
+| `tts_engine.py` | `ChatTTSEngine`：懒加载（线程安全双检锁）、`preprocess_text → segment_text` 集成、token/原子-aware 分片、分段合成 + 段间静音、变速、WAV 编码；自定义异常层级 |
 | `speakers.py` | 随机音色采样、`seed → embedding` 缓存（可复现）、预置命名音色清单 |
 | `concurrency.py` | `InferenceGate`：`asyncio.Semaphore` 限制并发，`slot()` 上下文管理器，超时抛 `QueueTimeoutError` |
 
@@ -101,10 +105,10 @@
 
 ```text
 请求 text
-  → 文本归一化（合并空白等）
-  → 长文本切分（中文标点 / 软断点 / 字数阈值，合并过短段）
+  → 文本预处理（清洗 / Markdown·段落结构化 / 数字·日期·金额·单位读法 / token 白名单 / 产出原子片段 + refine_prompt）
+  → token/原子-aware 分片（句末硬断点 / 软断点 / 受约束硬切，不切开原子片段；流式首片小、后续片大双阈值）
   → 解析音色 seed → speaker embedding（带缓存，可复现）
-  → 逐段 infer（spk_emb + 采样参数 top_P/top_K/temperature，可选 refine）
+  → 逐段 infer（spk_emb + 采样参数 top_P/top_K/temperature，可选 refine + refine_prompt）
   → 段间插入静音 → 拼接 → numpy float32
   → 变速（numpy 线性插值，无 ffmpeg/scipy）
   → soundfile 编码 24kHz mono WAV bytes → 返回 audio/wav
@@ -226,6 +230,7 @@ npm run dev
 | POST | `/api/speakers/random` | 采样一个新随机音色 | `SpeakerResponse` |
 | POST | `/api/tts` | 文本合成为 WAV（普通生成） | 二进制 `audio/wav` |
 | POST | `/api/tts/stream` | 文本合成（SSE 流式输出） | `text/event-stream` |
+| POST | `/api/tts/preprocess` | 文本预处理预览（不触发推理） | `PreprocessResponse` JSON |
 | GET | `/` | 前端页面 | HTML |
 
 ### `POST /api/tts` 请求体
@@ -239,9 +244,22 @@ npm run dev
   "temperature": 0.3,                    // 采样温度
   "top_p": 0.7,
   "top_k": 20,
-  "format": "wav"
+  "format": "wav",
+  // ---- 文本预处理参数（普通与流式接口都生效）----
+  "preprocess": true,                    // 是否启用文本预处理
+  "preprocess_profile": "balanced",      // 增强强度：plain / balanced / expressive
+  "prosody": "natural",                  // 朗读风格：flat / natural / dialogue / narration
+  "allow_control_tokens": false,         // 是否允许原文中的 ChatTTS 控制 token 生效
+  // ---- 流式分片参数（仅 /api/tts/stream 生效）----
+  "first_segment_chars": null,           // 流式首片目标上限，缺省走 STREAM_FIRST_SEGMENT_CHARS
+  "max_segment_chars": null              // 流式后续分片目标上限，缺省走 STREAM_SEGMENT_CHARS
 }
 ```
+
+> 预处理字段对普通与流式接口都生效；分片字段仅流式生效。`refine` 与 `prosody` 的关系：
+> `refine=false`（默认）走文本内 token 路径，`refine_prompt` 为 `null`；`refine=true` 时
+> `prosody` 映射为 ChatTTS `refine_prompt`（如 `natural` → `[oral_2][laugh_0][break_4]`），
+> 二者互斥、永不叠加。
 
 成功返回 `audio/wav` 二进制；失败返回 JSON `{"detail": "..."}`。
 
@@ -284,6 +302,45 @@ curl -N http://localhost:8000/api/tts/stream \
 > `Cache-Control: no-cache`；若前置代理仍缓冲，请在代理侧关闭对应缓冲（如 nginx
 > `proxy_buffering off;`）。
 
+### `POST /api/tts/preprocess` 文本预处理预览
+
+纯文本处理，**不经过推理门控、不触发模型推理、不占用显存槽位**，用于前端「一键整理」预览
+朗读结果。请求体复用 `TTSRequest` 的文本与预处理字段（`text` / `preprocess` /
+`preprocess_profile` / `prosody` / `allow_control_tokens`，及可选 `first_segment_chars` /
+`max_segment_chars` 以预览分片）。预览不改变后续 TTS 请求真值：提交合成时仍发送原文，由
+服务端再次完整预处理（所见即所得）。
+
+响应 `PreprocessResponse`：
+
+```json
+{
+  "original_text": "2026-06-04 的转化率是 12.5%。",
+  "normalized_text": "二零二六年六月四日 的转化率是 百分之十二点五。",
+  "refine_prompt": null,
+  "prosody": "natural",
+  "profile": "balanced",
+  "refine_mode": "token_injection",
+  "segments": [
+    { "index": 0, "text": "二零二六年六月四日 的转化率是 百分之十二点五。" }
+  ],
+  "changes": [
+    { "type": "date", "from": "2026-06-04", "to": "二零二六年六月四日" },
+    { "type": "percent", "from": "12.5%", "to": "百分之十二点五" }
+  ]
+}
+```
+
+- `refine_mode`：`token_injection`（`refine=false`，`refine_prompt` 为 `null`）或
+  `refine_prompt`（`refine=true`，回显映射出的 prompt）。
+- `changes[].type`/`from`/`to`：变更记录，便于核对哪些片段被规范化。
+- `segments`：预览分片（默认用流式双阈值，可被请求字段覆盖）。
+
+```bash
+curl -X POST http://localhost:8000/api/tts/preprocess \
+  -H "Content-Type: application/json" \
+  -d '{"text":"2026-06-04 的转化率是 12.5%。","prosody":"natural"}'
+```
+
 ### 约定
 
 - `/api/tts` 与 `/api/tts/stream` 共享同一并发门控（`inference_gate`）；排队超过 `QUEUE_TIMEOUT` 返回 503 `{"detail":"服务繁忙，请稍后重试"}`。流式接口整条流持有一个槽位直到结束。
@@ -306,7 +363,9 @@ curl -N http://localhost:8000/api/tts/stream \
 | `DEFAULT_SPEED` | 1.0 | 默认语速 |
 | `MAX_TEXT_LEN` | 2000 | 单请求最大字数 |
 | `MAX_SEGMENT_CHARS` | 120 | 普通接口 `POST /api/tts` 的长文本切分阈值 |
-| `STREAM_MAX_SEGMENT_CHARS` | 50 | 流式接口 `POST /api/tts/stream` 的切分阈值；调小→分片更多更快出首声、调大→更接近普通生成 |
+| `STREAM_FIRST_SEGMENT_CHARS` | 50 | 流式首片目标上限：小→更快出首声 |
+| `STREAM_SEGMENT_CHARS` | 100 | 流式后续分片目标上限：大→更连贯、推理次数更少（取代旧 `STREAM_MAX_SEGMENT_CHARS`，仅设旧变量时按本项读取并告警） |
+| `STREAM_FIRST_HARD_CAP` | 90 | 流式首片无法在自然断点结束时的硬上限 |
 | `SILENCE_MS_BETWEEN_SEGMENTS` | 120 | 段间静音毫秒 |
 | `MAX_CONCURRENCY` | 1 | 最大并发推理数（显存约束） |
 | `QUEUE_TIMEOUT` | 60.0 | 排队超时秒数 |
@@ -342,7 +401,7 @@ A：采样存在随机性。固定 `seed`（音色）+ 文本 + 采样参数可�
 | 推理后端 | ONNX Runtime，CPU-only | PyTorch + transformers，GPU 优先 |
 | 引擎依赖 | `kokoro-onnx` 包 | 官方 `ChatTTS` 包 |
 | 音色 | 固定 100+ 预置音色 | 随机采样 + seed 可复现 + 默认音色 |
-| 额外能力 | — | 文本 refine、采样参数（temperature/top_p/top_k）可调 |
+| 额外能力 | — | 文本 refine、采样参数（temperature/top_p/top_k）可调、文本预处理管线 + 一键预览 |
 | 默认并发 | CPU 核数 | 1（显存约束） |
 | 端口 | 8080 | 8000 |
 | 其余架构 | 单进程单端口、React+Vite、多阶段 Docker、SPA fallback、健康检查、并发门控 | **完全一致** |

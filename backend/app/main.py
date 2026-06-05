@@ -26,8 +26,16 @@ from fastapi.staticfiles import StaticFiles
 
 from .concurrency import QueueTimeoutError, inference_gate
 from .config import settings
-from .schemas import HealthResponse, SpeakerResponse, TTSRequest
+from .schemas import (
+    HealthResponse,
+    PreprocessChangeItem,
+    PreprocessResponse,
+    PreprocessSegmentItem,
+    SpeakerResponse,
+    TTSRequest,
+)
 from .speakers import parse_speaker, speaker_registry
+from .text_preprocess import PreprocessOptions
 from .tts_engine import ModelAssetError, SynthesisError, encode_wav, engine
 
 logger = logging.getLogger("chattts.service")
@@ -205,8 +213,68 @@ async def tts(request: TTSRequest) -> Response:
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
+            options=_build_preprocess_options(request),
         )
     return Response(content=wav_bytes, media_type="audio/wav")
+
+
+def _build_preprocess_options(payload: TTSRequest) -> PreprocessOptions:
+    """从请求体构造预处理选项（普通 / 流式 / 预览三处复用，保证语义一致）。"""
+
+    return PreprocessOptions(
+        enabled=payload.preprocess,
+        profile=payload.preprocess_profile,
+        prosody=payload.prosody,
+        allow_control_tokens=payload.allow_control_tokens,
+        refine=payload.refine,
+    )
+
+
+@app.post(
+    "/api/tts/preprocess",
+    response_model=PreprocessResponse,
+    responses={400: {"description": "请求参数非法"}},
+)
+async def tts_preprocess(payload: TTSRequest) -> PreprocessResponse:
+    """文本预处理预览（落实 6.9 / D5）。
+
+    纯文本处理，**不经过 ``inference_gate`` 推理门控**、不触发模型推理，因此不占用显存
+    槽位。返回归一化文本、预览分片、变更记录与 D1 路径信息，供前端「一键整理」展示。
+    提交 TTS 时仍发送用户原文，由服务端再次完整预处理（D5）。
+    """
+
+    options = _build_preprocess_options(payload)
+    # 预览默认用流式双阈值，可被请求字段覆盖（见 6.9）。
+    first_chars = payload.first_segment_chars or settings.stream_first_segment_chars
+    rest_chars = payload.max_segment_chars or settings.stream_segment_chars
+
+    # plan_segments 为纯函数（不触发推理）：复用它保证预览分片与真实合成分片完全一致。
+    plan = await asyncio.to_thread(
+        engine.plan_segments,
+        payload.text,
+        speaker=payload.speaker,
+        speed=payload.speed,
+        options=options,
+        first_chars=first_chars,
+        rest_chars=rest_chars,
+    )
+    result = plan.result
+    return PreprocessResponse(
+        original_text=payload.text,
+        normalized_text=result.text,
+        refine_prompt=result.refine_prompt,
+        prosody=options.prosody,
+        profile=options.profile,
+        refine_mode=result.refine_mode,
+        segments=[
+            PreprocessSegmentItem(index=index, text=segment)
+            for index, segment in enumerate(plan.segments)
+        ],
+        changes=[
+            PreprocessChangeItem(type=change.type, **{"from": change.source}, to=change.target)
+            for change in result.changes
+        ],
+    )
 
 
 def _sse_event(event: str, data: dict) -> bytes:
@@ -251,18 +319,24 @@ async def tts_stream(payload: TTSRequest, request: Request) -> StreamingResponse
     # 单次请求 id，用于把日志与一次流式会话关联起来。
     request_id = uuid.uuid4().hex[:8]
 
-    # 1+2. 音色显式校验与参数校验/切分：失败统一抛 ValueError → 全局 handler 400。
-    #    流式接口用更小的 STREAM_MAX_SEGMENT_CHARS 切分，分片更多 → 首片更快到达、
-    #    全程更流畅（代价是推理次数增多、总时长略升）。客户端可通过 payload.max_segment_chars
-    #    覆盖该默认值，schema 已限定范围 10~500。
+    # 1+2. 音色显式校验与参数校验/预处理/切分：失败统一抛 ValueError → 全局 handler 400。
+    #    流式接口用双阈值（首片小、后续片大）切分：首片更快到达、后续更连贯（见 6.8）。
+    #    客户端可通过 first_segment_chars / max_segment_chars 覆盖默认值（schema 限定 10~500）。
     parse_speaker(payload.speaker)
-    max_chars = payload.max_segment_chars or settings.stream_max_segment_chars
-    seed, selected_speed, segments = engine.plan_segments(
+    first_chars = payload.first_segment_chars or settings.stream_first_segment_chars
+    rest_chars = payload.max_segment_chars or settings.stream_segment_chars
+    plan = engine.plan_segments(
         payload.text,
         speaker=payload.speaker,
         speed=payload.speed,
-        max_chars=max_chars,
+        options=_build_preprocess_options(payload),
+        first_chars=first_chars,
+        rest_chars=rest_chars,
     )
+    seed = plan.seed
+    selected_speed = plan.speed
+    segments = plan.segments
+    refine_prompt = plan.refine_prompt
 
     # 3. 模型资产/就绪校验：缺资产时 ModelAssetError → 全局 handler 503。
     await asyncio.to_thread(engine.load)
@@ -327,6 +401,7 @@ async def tts_stream(payload: TTSRequest, request: Request) -> StreamingResponse
                         temperature=payload.temperature,
                         top_p=payload.top_p,
                         top_k=payload.top_k,
+                        refine_prompt=refine_prompt,
                     )
                 except SynthesisError as exc:
                     # 已返回 200，无法再改 HTTP 状态码，只能用 error 事件通知前端。

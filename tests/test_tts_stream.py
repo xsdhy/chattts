@@ -25,7 +25,26 @@ import pytest
 from backend.app.concurrency import QueueTimeoutError, inference_gate
 from backend.app.config import settings
 from backend.app.main import app
-from backend.app.tts_engine import ModelAssetError, SegmentSynthesis, engine
+from backend.app.text_preprocess import PreprocessResult
+from backend.app.tts_engine import (
+    ModelAssetError,
+    SegmentPlan,
+    SegmentSynthesis,
+    engine,
+)
+
+
+def _fake_plan(seed: int, speed: float, segments, refine_prompt=None) -> SegmentPlan:
+    """构造一个假的 ``SegmentPlan``，供 monkeypatch ``plan_segments`` 使用。"""
+
+    segs = list(segments)
+    return SegmentPlan(
+        seed=seed,
+        speed=speed,
+        segments=segs,
+        refine_prompt=refine_prompt,
+        result=PreprocessResult(text="".join(segs)),
+    )
 
 
 def _parse_sse(text: str) -> list[tuple[str | None, dict | None]]:
@@ -87,7 +106,7 @@ async def test_stream_success_event_order(monkeypatch):
     monkeypatch.setattr(
         engine,
         "plan_segments",
-        lambda text, *, speaker=None, speed=None, max_chars=None: (2, 1.0, ["一", "二", "三"]),
+        lambda text, **kwargs: _fake_plan(2, 1.0, ["一", "二", "三"]),
     )
 
     slots_before = inference_gate.available
@@ -157,7 +176,7 @@ async def test_queue_timeout_returns_503(monkeypatch):
     monkeypatch.setattr(
         engine,
         "plan_segments",
-        lambda text, *, speaker=None, speed=None, max_chars=None: (2, 1.0, ["一"]),
+        lambda text, **kwargs: _fake_plan(2, 1.0, ["一"]),
     )
 
     async def _raise_timeout():
@@ -181,7 +200,7 @@ async def test_model_asset_error_returns_503(monkeypatch):
     monkeypatch.setattr(
         engine,
         "plan_segments",
-        lambda text, *, speaker=None, speed=None, max_chars=None: (2, 1.0, ["一"]),
+        lambda text, **kwargs: _fake_plan(2, 1.0, ["一"]),
     )
 
     def _raise_asset():
@@ -205,7 +224,7 @@ async def test_disconnect_releases_slot(monkeypatch):
     monkeypatch.setattr(
         engine,
         "plan_segments",
-        lambda text, *, speaker=None, speed=None, max_chars=None: (2, 1.0, ["一", "二", "三"]),
+        lambda text, **kwargs: _fake_plan(2, 1.0, ["一", "二", "三"]),
     )
 
     # 模拟客户端在进入循环时即处于断开状态：第一段开始前检测到断开并退出。
@@ -239,27 +258,30 @@ async def test_disconnect_releases_slot(monkeypatch):
 def test_stream_uses_smaller_segments_than_normal():
     """流式分片更小（提升体感速度）：
 
-    同一段中等长度文本，流式用 ``STREAM_MAX_SEGMENT_CHARS`` 切分应得到不少于普通
-    ``MAX_SEGMENT_CHARS`` 的分段数，且每段长度都不超过流式上限——分片更多、更小，
-    首片更快到达。``plan_segments`` 为纯函数，不触发推理。
+    同一段中等长度文本，流式用双阈值（首片 ``STREAM_FIRST_SEGMENT_CHARS``、后续片
+    ``STREAM_SEGMENT_CHARS``）切分应得到不少于普通 ``MAX_SEGMENT_CHARS`` 的分段数，
+    且首片不超过首片硬上限——首片更快到达。``plan_segments`` 为纯函数，不触发推理。
     """
 
-    assert settings.stream_max_segment_chars < settings.max_segment_chars
+    assert settings.stream_first_segment_chars < settings.max_segment_chars
 
-    # 一段会被普通阈值合并成 1 段、但超过流式阈值的中等文本。
+    # 一段会被普通阈值合并成 1 段、但会被流式首片阈值拆开的中等文本。
     text = "你好，欢迎使用流式语音合成服务，" * 4 + "希望第一声尽快出来。"
 
-    _, _, normal = engine.plan_segments(text)
-    _, _, stream = engine.plan_segments(
-        text, max_chars=settings.stream_max_segment_chars
-    )
+    normal = engine.plan_segments(text).segments
+    stream = engine.plan_segments(
+        text,
+        first_chars=settings.stream_first_segment_chars,
+        rest_chars=settings.stream_segment_chars,
+    ).segments
 
     assert len(stream) >= len(normal)
-    assert all(len(seg) <= settings.stream_max_segment_chars for seg in stream)
+    # 首片不超过首片硬上限（双阈值「首片求快」语义）。
+    assert len(stream[0]) <= settings.stream_first_hard_cap
 
 
 async def test_stream_respects_request_max_segment_chars(monkeypatch):
-    """请求体的 ``max_segment_chars`` 应覆盖默认 ``STREAM_MAX_SEGMENT_CHARS``。
+    """请求体的 ``max_segment_chars`` 应覆盖默认 ``STREAM_SEGMENT_CHARS``（后续分片目标上限）。
 
     构造一段长文本，分别用 ``max_segment_chars=20`` 和 ``max_segment_chars=100`` 请求，
     断言更小的上限产出更多 audio 事件。
@@ -331,7 +353,7 @@ async def test_streamed_segments_match_full_synthesis(monkeypatch):
     monkeypatch.setattr(
         engine,
         "plan_segments",
-        lambda text, *, speaker=None, speed=None, max_chars=None: (2, 1.0, list(segments)),
+        lambda text, **kwargs: _fake_plan(2, 1.0, list(segments)),
     )
 
     # 跳过对真实 ChatTTS 的依赖：embedding 与采样参数构造都打桩。
@@ -358,16 +380,21 @@ async def test_streamed_segments_match_full_synthesis(monkeypatch):
     full = engine.synthesize("整段文本", speaker="2", speed=1.0)
 
     # 逐段拼接（流式接口路径：plan_segments + synthesize_segment，与路由一致）。
-    seed, selected_speed, planned = engine.plan_segments(
-        "整段文本", speaker="2", speed=1.0, max_chars=settings.stream_max_segment_chars
+    plan = engine.plan_segments(
+        "整段文本",
+        speaker="2",
+        speed=1.0,
+        first_chars=settings.stream_first_segment_chars,
+        rest_chars=settings.stream_segment_chars,
     )
+    planned = plan.segments
     streamed = [
         engine.synthesize_segment(
             seg,
             idx,
             len(planned),
-            seed=seed,
-            speed=selected_speed,
+            seed=plan.seed,
+            speed=plan.speed,
         )
         for idx, seg in enumerate(planned)
     ]
